@@ -9,13 +9,13 @@ Langmuir Probe MCP Server v1.0.0 — IV 曲线分析 + EEPF + 模式检测 + 非
   probe_analyze      — 单条 IV 曲线全量分析
   probe_batch         — 批量处理文件夹内所有 CSV
   probe_eepf          — 单独重建 EEPF (Druyvesteyn 公式)
-  probe_detect_modes  — 模式判别 (SPOT/OSC/PLUME)
+  probe_detect_modes  — 模式判别 (MODE_A/OSC/MODE_C)
   probe_detect_steps  — dI/dV 台阶检测 + 四项伪影排除
   probe_detect_upturn — dI/dV 末端上翘检测
   probe_gate          — 物理合理性闸门 (数值/一致性)
   probe_gate_multi_ai — 多AI联合审计闸门 (可选: 接入Ollama/OpenAI)
   probe_visual_qa     — 批量多模态视觉验证 (VL模型看图核验)
-  probe_compare       — 两装置对比 (阴极 vs 阳极)
+  probe_compare       — 两装置对比 (配置A vs 配置B)
   probe_plot          — 生成诊断图表
   probe_info          — 探针参数/技术参考
 
@@ -136,9 +136,9 @@ PHYSICAL_RANGES = {
 
 # 模式判别阈值
 MODE_RULES = {
-    "SPOT":  {"ftail_max": 25,  "sheath_range": (3.8, 4.5), "note": "恒压,纹波<1%"},
+    "MODE_A":  {"ftail_max": 25,  "sheath_range": (3.8, 4.5), "note": "恒压,纹波<1%"},
     "OSC":   {"ftail_max": 30,  "sheath_range": (3.9, 4.6), "note": "呼吸模出现,纹波5-20%"},
-    "PLUME": {"ftail_min": 25,  "sheath_range": (3.8, 4.5), "note": "恒流转压,纹波>20%"},
+    "MODE_C": {"ftail_min": 25,  "sheath_range": (3.8, 4.5), "note": "恒流转压,纹波>20%"},
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -458,21 +458,21 @@ def detect_upturn(voltage: np.ndarray, dy: np.ndarray, Vp: float) -> dict:
 
 
 def classify_mode(ftail: float, sheath_ratio: float, has_breathing: bool = False) -> dict:
-    """模式判别: SPOT / OSC / PLUME"""
+    """模式判别: MODE_A / OSC / MODE_C"""
     if ftail > 30 or (ftail > 25 and not has_breathing):
-        mode = "PLUME"
+        mode = "MODE_C"
     elif has_breathing or ftail > 20:
-        mode = "OSCILLATING"
+        mode = "MODE_B"
     else:
-        mode = "SPOT"
+        mode = "MODE_A"
 
-    confidence = "high" if (mode == "PLUME" and ftail > 35) or (mode == "SPOT" and ftail < 15) else "medium"
+    confidence = "high" if (mode == "MODE_C" and ftail > 35) or (mode == "MODE_A" and ftail < 15) else "medium"
 
     return {"mode": mode, "confidence": confidence,
-            "SPOT": "恒压300V, 纹波<1%, f_tail<25%",
-            "OSCILLATING": "呼吸模~30kHz, 纹波5-20%, f_tail 20-30%",
-            "PLUME": "恒流转压, 纹波>20%, f_tail>25%",
-            "alpha_note": "α = B²/ṁ — 高α→SPOT, 低α→PLUME (Lafleur & Chabert 2025)"}
+            "MODE_A": "稳定态: 低波动, 低高能电子占比",
+            "MODE_B": "过渡态: 出现振荡, 高能电子增多",
+            "MODE_C": "失稳态: 强波动, 高能电子占比显著升高",
+            "alpha_note": "α = B²/ṁ — 高α→MODE_A, 低α→MODE_C (Lafleur & Chabert 2025)"}
 
 
 def gate_check(vp_result: dict, te_result: dict, ftail_metrics: dict) -> dict:
@@ -618,7 +618,7 @@ def probe_batch(folder_path: str, R_mm: float = 0.075, L_mm: float = 8.0) -> dic
 
     results = []
     summary = {"total": len(csv_files), "success": 0, "failed": 0,
-               "modes": {"SPOT": 0, "OSCILLATING": 0, "PLUME": 0}}
+               "modes": {"MODE_A": 0, "MODE_B": 0, "MODE_C": 0}}
 
     for fp in csv_files:
         try:
@@ -701,7 +701,7 @@ def probe_eepf(filepath: str, Vp: Optional[float] = None,
 
 @mcp.tool()
 def probe_detect_modes(ftail_values: list, sheath_values: list = None) -> dict:
-    """模式判别 — 根据 f_tail 和 sheath_ratio 分类 SPOT/OSC/PLUME
+    """模式判别 — 根据 f_tail 和 sheath_ratio 分类 MODE_A/OSC/MODE_C
 
     Args:
         ftail_values: f_tail 值列表 (%)
@@ -712,7 +712,7 @@ def probe_detect_modes(ftail_values: list, sheath_values: list = None) -> dict:
         sr = sheath_values[i] if sheath_values and i < len(sheath_values) else 4.17
         modes.append(classify_mode(ftail, sr))
 
-    counts = {"SPOT": 0, "OSCILLATING": 0, "PLUME": 0}
+    counts = {"MODE_A": 0, "MODE_B": 0, "MODE_C": 0}
     for m in modes:
         counts[m["mode"]] = counts.get(m["mode"], 0) + 1
 
@@ -787,7 +787,7 @@ def probe_gate(Vp: float, Vf: float, Te: float, Teff: float, ftail: float,
 @mcp.tool()
 def probe_compare(filepath1: str, filepath2: str, label1: str = "装置1",
                   label2: str = "装置2") -> dict:
-    """两装置 IV 曲线对比 — 阴极 vs 阳极 / 不同工况
+    """两装置 IV 曲线对比 — 配置A vs 配置B / 不同工况
 
     Args:
         filepath1, filepath2: 两个 CSV 文件路径
@@ -1010,7 +1010,7 @@ def probe_gate_multi_ai(filepath: str, audit_dimensions: str = "all") -> dict:
     if audit_dimensions in ("all", "historical"):
         model = _LLM_CONFIG["historical"] or _LLM_CONFIG["numerical"]
         if model:
-            prompt = f"已知基线: sheath_ratio=4.17±0.23, f_tail(SPOT)=19.5%, f_tail(OSC)=21.2%, f_tail(PLUME)=34.7%, Teff(SPOT/OSC)=18-20eV, Teff(PLUME)=15eV。当前参数:\n{json.dumps(params, indent=2, ensure_ascii=False)}\n判断是否偏离基线。输出JSON: {{\"matches_baseline\": true/false, \"deviations\": [{{\"param\":\"...\", \"expected\":\"...\", \"actual\":\"...\", \"drift_pct\":...}}]}}"
+            prompt = f"已知基线: sheath_ratio=4.17±0.23, f_tail(MODE_A)=19.5%, f_tail(OSC)=21.2%, f_tail(MODE_C)=34.7%, Teff(MODE_A/OSC)=18-20eV, Teff(MODE_C)=15eV。当前参数:\n{json.dumps(params, indent=2, ensure_ascii=False)}\n判断是否偏离基线。输出JSON: {{\"matches_baseline\": true/false, \"deviations\": [{{\"param\":\"...\", \"expected\":\"...\", \"actual\":\"...\", \"drift_pct\":...}}]}}"
             resp = _call_llm(prompt, model, system_prompt)
             results["historical"] = resp
             if resp["status"] == "ok":
@@ -1213,6 +1213,7 @@ def probe_spectrum(filepath: str, fs_hz: float = 200000.0, detect_modes: bool = 
     """
     try:
         import pandas as pd
+        filepath = _safe_path(filepath)
         df = pd.read_csv(filepath)
     except:
         return {"status": "error", "error": "CSV read failed"}
@@ -1309,16 +1310,16 @@ def probe_similarity(alpha_values: list = None, ftail_values: list = None,
     if ftail_values:
         modes = []
         for f in ftail_values:
-            if f > 30: modes.append("PLUME")
-            elif f > 20: modes.append("OSCILLATING")
-            else: modes.append("SPOT")
+            if f > 30: modes.append("MODE_C")
+            elif f > 20: modes.append("MODE_B")
+            else: modes.append("MODE_A")
         from collections import Counter
         counts = dict(Counter(modes))
         result["mode_distribution"] = counts
         result["mode_boundaries"] = {
-            "SPOT": "ftail < 25% (typical: ~19.5%)",
-            "OSCILLATING": "ftail 20-30% (typical: ~21.2%)",
-            "PLUME": "ftail > 25% (typical: ~34.7%)"}
+            "MODE_A": "ftail < 25% (typical: ~19.5%)",
+            "MODE_B": "ftail 20-30% (typical: ~21.2%)",
+            "MODE_C": "ftail > 25% (typical: ~34.7%)"}
 
     # Derived similarity parameters
     result["related_parameters"] = {
@@ -1334,7 +1335,7 @@ def probe_predict_mode(ftail: float, I_std: float = None, log10_alpha: float = N
     """Plume概率预测 — 逻辑回归融合模型 (88.9% accuracy)
 
     基于66组Kr工质B场扫描标定的融合模型:
-    P(OSC/PLUME) = sigma(-2.99 + 0.034*log10(alpha) + 2.748*I_std + 0.098*f_tail)
+    P(OSC/MODE_C) = sigma(-2.99 + 0.034*log10(alpha) + 2.748*I_std + 0.098*f_tail)
 
     Args:
         ftail: 高能密度占比 (%)
@@ -1346,16 +1347,16 @@ def probe_predict_mode(ftail: float, I_std: float = None, log10_alpha: float = N
 
     # Use defaults if optional inputs missing
     if I_std is None:
-        I_std = 0.5  # typical OSC/PLUME value
+        I_std = 0.5  # typical OSC/MODE_C value
     if log10_alpha is None:
         log10_alpha = 2.0  # typical transition region
 
     z = w[0] + w[1]*log10_alpha + w[2]*I_std + w[3]*ftail
     prob = 1.0 / (1.0 + np.exp(-z))  # sigmoid
 
-    mode = "PLUME" if prob > 0.5 else ("OSCILLATING" if prob > 0.3 else "SPOT")
+    mode = "MODE_C" if prob > 0.5 else ("MODE_B" if prob > 0.3 else "MODE_A")
 
-    return {"status": "ok", "probability_OSC_PLUME": round(float(prob*100), 1),
+    return {"status": "ok", "probability_OSC_MODE_C": round(float(prob*100), 1),
             "predicted_mode": mode, "model_accuracy": "88.9%",
             "coefficients": {"intercept": w[0], "log10_alpha": w[1], "I_std": w[2], "ftail": w[3]},
             "note": "模型基于66组Kr工质B场扫描标定。不同工质/推力器需重新标定。"}
@@ -1363,7 +1364,7 @@ def probe_predict_mode(ftail: float, I_std: float = None, log10_alpha: float = N
 
 @mcp.tool()
 def probe_stratify(filepath_list: list, group_labels: list = None,
-                   group_by: str = "keeper_current") -> dict:
+                   group_by: str = "discharge_config") -> dict:
     """分层分析 — 防止Simpson悖论
 
     按分组变量(如keeper电流/流量/磁场)分层统计，自动检测合并vs分组的符号反转。
@@ -1371,7 +1372,7 @@ def probe_stratify(filepath_list: list, group_labels: list = None,
     Args:
         filepath_list: CSV文件路径列表
         group_labels: 每个文件的组标签 (如 ["1A","1A",...,"0.5A","0.5A",...])
-        group_by: 分组变量名 (默认 keeper_current)
+        group_by: 分组变量名 (默认 discharge_config)
     """
     if not group_labels:
         return {"status": "error", "error": "需要group_labels参数指定每个文件的分组"}
@@ -1446,9 +1447,9 @@ def probe_stratify(filepath_list: list, group_labels: list = None,
 @mcp.tool()
 def probe_anode_detect(filepath: str, jump_threshold_mA_s: float = 30.0,
                        plateau_min_duration_s: float = 30.0) -> dict:
-    """阳极电流跳变检测 — 识别放电模式转变事件
+    """放电电流跳变检测 — 识别放电模式转变事件
 
-    适用于阳极电源遥测CSV (含Time, Current列)。
+    适用于放电电源遥测CSV (含Time, Current列)。
 
     Args:
         filepath: 阳极遥测CSV
@@ -1524,6 +1525,8 @@ _original_probe_plot = probe_plot
 @mcp.tool()
 def probe_plot_extended(filepath: str, plot_type: str = "all",
                         output_format: str = "png") -> dict:
+    if output_format not in ("png", "svg", "pdf"):
+        output_format = "png"
     """扩展诊断图 — 新增: OML线性检验(I^0.75)、ln(I)-V、双温拟合叠加
 
     Args:

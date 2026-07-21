@@ -1,40 +1,34 @@
-# Langmuir Probe MCP v1.0.0
+# Langmuir Probe MCP v1.2.0
 
-朗缪尔探针 IV 曲线分析 MCP Server — 纯 Python，零 MATLAB 依赖。
+Langmuir probe IV curve analysis MCP Server — pure Python, zero MATLAB dependency.
 
-## 技术栈
+## Tech Stack
 
-10 个 MCP 工具，覆盖 **51 项分析技术**，源自 66 组霍尔推力器 B 场扫描 + 36 组阴极单放电实验验证：
+21 MCP tools covering 46/51 analysis techniques, validated on low-temperature plasma experiments:
 
-| 层级 | 工具 | 技术 |
-|------|------|------|
-| **L0 预处理** | `probe_analyze` | 高斯平滑、CSV解析、探针面积 |
-| **L1 特征提取** | `probe_analyze` | Vf/Vp 检测、经典 Te/Ne、dI/dV/d²I/dV² |
-| **L2 EEPF** | `probe_eepf` | Druyvesteyn 重建、EEPF 多峰分解(Cellarius 1970) |
-| **L3 非麦克斯韦** | `probe_analyze` | f_tail(Jauberteau 2018)、T_eff(Godyak 1990)、Te_corr、sheath_ratio |
-| **L4 模式判别** | `probe_detect_modes` | SPOT/OSC/PLUME 分类 |
-| **L5 结构检测** | `probe_detect_steps` `probe_detect_upturn` | dI/dV 台阶(四项伪影排除)、末端上翘 |
-| **L6 质量闸门** | `probe_gate` | 数值范围/一致性/历史三层闸门 |
-| **L7 对比** | `probe_compare` | 两装置对比(阴极 vs 阳极) |
-| **L8 可视化** | `probe_plot` | IV+dI/dV 双轴图、EEPF 峰标注图 |
-| **L9 批量** | `probe_batch` | 文件夹批量处理 → result.txt |
-| **参考** | `probe_info` | 公式/物理范围/模式阈值/文献 |
+| Layer | Tools | Techniques |
+|-------|-------|------------|
+| **L0 Preprocessing** | probe_analyze probe_batch | Gaussian smooth, CSV parse, probe area, batch |
+| **L1 Feature Extract** | probe_eepf probe_fit_bimaxwell probe_spectrum | Vf/Vp, Te/Ne, Druyvesteyn EEPF, Yip 2020 bi-Maxwell, FFT |
+| **L2 Constraint** | probe_similarity probe_predict_mode | alpha param (Lafleur 2025), mode probability (88.9%) |
+| **L3 Mode Detection** | probe_detect_modes | MODE_A / MODE_B / MODE_C classification |
+| **L4 Structure** | probe_detect_steps probe_detect_upturn probe_detect_comb_teeth probe_anode_detect | dI/dV staircase, end-upturn, comb-teeth, current jumps |
+| **L5 Quality Gate** | probe_gate probe_gate_multi_ai | Numerical/consistency gate + multi-AI audit |
+| **L6 Verification** | probe_visual_qa probe_stratify | VL visual check + stratified analysis (Simpson) |
+| **L7 Comparison** | probe_compare | Cross-configuration comparison |
+| **L8 Visualization** | probe_plot probe_plot_extended | IV+dI/dV, EEPF, OML check, Log(I)-V, bi-Maxwell |
+| **L9 Reference** | probe_info | Formulas, ranges, thresholds, bibliography |
 
-## 安装
+## Install
 
-```bash
 pip install -e .
-```
 
-## 使用
+## Usage
 
-```bash
 langmuir-probe-mcp
-```
 
-或在 Claude Code 中配置为 MCP server：
+Or configure as MCP server in Claude Code:
 
-```json
 {
   "mcpServers": {
     "langmuir-probe": {
@@ -43,21 +37,25 @@ langmuir-probe-mcp
     }
   }
 }
-```
 
-## 输出目录
+## Optional: LLM Enhancement
 
-默认 `./langmuir_mcp_output/`，可通过环境变量 `PROBE_MCP_OUTPUT` 覆盖。
+# Multi-AI audit gate
+export PROBE_LLM_NUMERICAL=qwen3:32b
+export PROBE_LLM_API_BASE=http://127.0.0.1:11434/v1
 
-## 文献
+# Visual verification
+export PROBE_LLM_VISION=llava:13b
 
-- Godyak & Piejak 1990, PRL 65:996 — T_eff 定义
-- Godyak & Demidov 2011, J. Phys. D 44:233001 — 探针 EEDF 综述
+## References
+
+- Godyak & Piejak 1990, PRL 65:996 — T_eff definition
+- Godyak & Demidov 2011, J. Phys. D 44:233001 — probe EEDF review
 - Jauberteau & Jauberteau 2018, Contrib. Plasma Phys. — f_tail
-- Lobbia & Beal 2017, AIAA JPC — 电推进探针推荐实践
-- Lafleur & Chabert 2025, PSST 34:055005 — α 相似参数
-- Yip et al. 2020, Plasma Sci. Technol. 22:085404 — 双温迭代
-- Cellarius 1970 / Draganov 2025, Vacuum 235 — EEPF 多群分解
+- Lobbia & Beal 2017, AIAA JPC — probe diagnostics best practice
+- Lafleur & Chabert 2025, PSST 34:055005 — alpha similarity
+- Yip et al. 2020, Plasma Sci. Technol. 22:085404 — bi-Maxwell iteration
+- Cellarius 1970 / Draganov 2025, Vacuum 235 — EEPF multi-group
 
 ## License
 
