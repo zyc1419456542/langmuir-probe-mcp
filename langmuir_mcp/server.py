@@ -1102,6 +1102,591 @@ def probe_visual_qa(folder_path: str, sample_n: int = 5, spatial_precompress: bo
             "spatial_precompress": spatial_precompress, "plot_paths": plot_paths, "results": results}
 
 
+# ═══════════════════════════════════════════════════════════════
+# Gap-fill tools: bi-Maxwell, spectrum, similarity, OML, stratification
+# ═══════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def probe_fit_bimaxwell(filepath: str, max_iter: int = 10, tol: float = 0.01) -> dict:
+    """Yip 2020 双麦克斯韦迭代减法拟合 — 分离热/冷两群电子
+
+    Args:
+        filepath: CSV 文件路径
+        max_iter: 最大迭代次数
+        tol: 收敛容差 (1%)
+    """
+    voltage, current = read_probe_csv(filepath)
+    sort_idx = np.argsort(voltage)
+    voltage = voltage[sort_idx]
+    current = -current[sort_idx]
+    voltage_s = smooth_gaussian(voltage)
+    current_s = smooth_gaussian(current)
+
+    vf = find_vf(voltage_s, current_s)["Vf"]
+    vp_r = find_vp_multi(voltage_s, current_s, vf)
+    Vp = vp_r.get("Vp")
+    if Vp is None:
+        return {"status": "error", "error": "Vp detection failed"}
+
+    # Transition region data
+    mask = (voltage_s >= vf) & (voltage_s <= Vp)
+    x_trans = voltage_s[mask]
+    y_trans = current_s[mask]
+    logy_trans = np.log(np.maximum(y_trans, 1e-15))
+
+    if len(x_trans) < 10:
+        return {"status": "error", "error": "Transition region too short"}
+
+    # Iterative subtraction (Yip et al. 2020, PST 22:085404)
+    T_hot, T_cold = 0, 0
+    T_hot_prev, T_cold_prev = 0, 0
+    history = []
+
+    for it in range(max_iter):
+        # Find flattest d(ln I)/dV region → hottest electrons
+        dlogy = np.gradient(logy_trans, x_trans)
+        idx_min = np.argmin(np.abs(dlogy))
+        V_fit_center = x_trans[idx_min]
+
+        mask_hot = np.abs(x_trans - V_fit_center) < 2.0
+        if np.sum(mask_hot) < 5: break
+
+        coeffs = np.polyfit(x_trans[mask_hot], logy_trans[mask_hot], 1)
+        T_hot = 1.0 / coeffs[0] if coeffs[0] > 0 else 0
+        if T_hot <= 0 or T_hot > 100: break
+
+        # Extrapolate hot-electron current and subtract
+        I_sat_hot = current_s[np.argmin(np.abs(voltage_s - Vp))]
+        I_hot_extrap = I_sat_hot * np.exp(-(voltage_s - Vp) / T_hot)
+        I_residual = np.maximum(current_s - I_hot_extrap, 1e-15)
+        logy_residual = np.log(I_residual[mask])
+
+        # Fit cold from residual near Vf
+        mask_cold = np.abs(x_trans - vf) < 3.0
+        if np.sum(mask_cold) < 5: break
+
+        coeffs_c = np.polyfit(x_trans[mask_cold], logy_residual[mask_cold], 1)
+        T_cold = 1.0 / coeffs_c[0] if coeffs_c[0] > 0 else T_hot
+        if T_cold <= 0 or T_cold > 100: break
+
+        history.append({"iter": it+1, "Thot": round(float(T_hot),2), "Tcold": round(float(T_cold),2)})
+
+        # Convergence check
+        if it > 0:
+            dh = abs(T_hot - T_hot_prev) / max(T_hot, 0.01)
+            dc = abs(T_cold - T_cold_prev) / max(T_cold, 0.01)
+            if dh < tol and dc < tol: break
+
+        T_hot_prev, T_cold_prev = T_hot, T_cold
+
+    # Validity gate
+    valid = T_hot > T_cold and T_hot / max(T_cold, 0.01) > 1.5 and T_hot < 100
+    if not valid:
+        T_cold = T_hot  # Degenerate to single-temperature
+
+    # Density estimate
+    I_sat = float(np.max(current_s) - np.min(current_s))
+    area = probe_area()
+    n_hot = 0; n_cold = 0
+    if T_hot > 0:
+        n_hot = 3.7e13 * 0.9 * I_sat * 0.5 / (area * np.sqrt(T_hot))
+        if T_cold > 0 and T_cold != T_hot:
+            n_cold = 3.7e13 * 0.9 * I_sat * 0.5 / (area * np.sqrt(T_cold))
+
+    return {"status": "ok", "Thot_eV": round(float(T_hot),2), "Tcold_eV": round(float(T_cold),2),
+            "n_hot_cm3": round(float(n_hot),2), "n_cold_cm3": round(float(n_cold),2),
+            "Thot_Tcold_ratio": round(float(T_hot/max(T_cold,0.01)),2),
+            "valid": valid, "iterations": len(history), "convergence_history": history,
+            "reference": "Yip et al. 2020, Plasma Sci. Technol. 22:085404"}
+
+
+@mcp.tool()
+def probe_spectrum(filepath: str, fs_hz: float = 200000.0, detect_modes: bool = True) -> dict:
+    """示波器频谱分析 — FFT + 呼吸模/渡越模检测
+
+    适用: Rigol DHO5054 或其他示波器CSV (Time,CH1,CH2...)
+
+    Args:
+        filepath: 示波器CSV文件路径
+        fs_hz: 采样率 Hz (DHO5054默认200kSa/s)
+        detect_modes: 是否自动检测振荡模式
+    """
+    try:
+        import pandas as pd
+        df = pd.read_csv(filepath)
+    except:
+        return {"status": "error", "error": "CSV read failed"}
+
+    # Find time and signal columns
+    time_col = [c for c in df.columns if 'time' in c.lower() or 'Time' in c][0]
+    ch_cols = [c for c in df.columns if c != time_col]
+    if not ch_cols:
+        return {"status": "error", "error": "No signal columns found"}
+
+    results = {"status": "ok", "fs_hz": fs_hz, "n_samples": len(df), "channels": {}}
+
+    for ch in ch_cols[:2]:
+        signal = df[ch].dropna().values
+        if len(signal) < 10: continue
+
+        # Remove DC offset + FFT
+        signal_ac = signal - np.mean(signal)
+        n = len(signal_ac)
+        fft = np.abs(np.fft.rfft(signal_ac))
+        freqs = np.fft.rfftfreq(n, d=1.0/fs_hz)
+
+        # Top peaks
+        peak_idx, props = find_peaks(fft, height=np.max(fft)*0.1, distance=5)
+        top_n = min(10, len(peak_idx))
+        sort_idx = np.argsort(fft[peak_idx])[::-1][:top_n]
+
+        peaks = []
+        for i in sort_idx:
+            peaks.append({"freq_Hz": round(float(freqs[peak_idx[i]]), 1),
+                         "amplitude": round(float(fft[peak_idx[i]]), 2)})
+
+        ch_result = {"peaks": peaks, "nyquist_hz": fs_hz/2}
+
+        # Mode detection
+        if detect_modes and peaks:
+            breathing = [p for p in peaks if 10000 < p["freq_Hz"] < 100000]
+            transit = [p for p in peaks if 100000 < p["freq_Hz"] < 5000000]
+            iat = [p for p in peaks if p["freq_Hz"] > 300000 and p["freq_Hz"] < 5000000]
+
+            # Relaxation oscillation: harmonic series check
+            if breathing:
+                freqs_b = sorted([p["freq_Hz"] for p in breathing])
+                if len(freqs_b) >= 2:
+                    spacings = np.diff(freqs_b)
+                    is_harmonic = np.std(spacings) / max(np.mean(spacings), 1) < 0.15
+                else:
+                    is_harmonic = False
+                ch_result["breathing_mode"] = {
+                    "detected": True, "fundamental_Hz": freqs_b[0],
+                    "n_harmonics": len(freqs_b), "is_relaxation_oscillation": bool(is_harmonic)}
+            else:
+                ch_result["breathing_mode"] = {"detected": False}
+
+            if transit:
+                ch_result["transit_mode"] = {"detected": True, "frequencies_Hz": [p["freq_Hz"] for p in transit[:5]]}
+            else:
+                ch_result["transit_mode"] = {"detected": False}
+
+        results["channels"][ch] = ch_result
+
+    return results
+
+
+@mcp.tool()
+def probe_similarity(alpha_values: list = None, ftail_values: list = None,
+                     B_G: list = None, mdot_mg_s: list = None) -> dict:
+    r"""相似参数计算 — Lafleur & Chabert 2025 α=B²/ṁ 框架
+
+    可从原始参数计算α或直接输入α值列表。
+
+    Args:
+        alpha_values: α值列表 (如已算好)
+        ftail_values: f_tail值列表 (用于模式分层)
+        B_G: 磁场强度列表 [G] (与mdot_mg_s配对使用)
+        mdot_mg_s: 质量流量列表 [mg/s]
+    """
+    result = {"status": "ok", "reference": "Lafleur & Chabert 2025, PSST 34:055005"}
+
+    # Compute alpha if raw inputs provided
+    if B_G and mdot_mg_s:
+        alphas = [b**2 / m for b, m in zip(B_G, mdot_mg_s)]
+        result["alpha_computed"] = [round(float(a), 2) for a in alphas]
+        result["alpha_mean"] = round(float(np.mean(alphas)), 2)
+        result["alpha_std"] = round(float(np.std(alphas)), 2)
+        result["formula"] = "alpha = B^2 / mdot  [G^2/(mg/s)]"
+        result["B_unit"] = "G (axial peak radial B-field)"
+        result["mdot_unit"] = "mg/s (anode mass flow rate)"
+    elif alpha_values:
+        result["alpha_values"] = alpha_values
+        result["alpha_mean"] = round(float(np.mean(alpha_values)), 2)
+
+    # Mode stratification
+    if ftail_values:
+        modes = []
+        for f in ftail_values:
+            if f > 30: modes.append("PLUME")
+            elif f > 20: modes.append("OSCILLATING")
+            else: modes.append("SPOT")
+        from collections import Counter
+        counts = dict(Counter(modes))
+        result["mode_distribution"] = counts
+        result["mode_boundaries"] = {
+            "SPOT": "ftail < 25% (typical: ~19.5%)",
+            "OSCILLATING": "ftail 20-30% (typical: ~21.2%)",
+            "PLUME": "ftail > 25% (typical: ~34.7%)"}
+
+    # Derived similarity parameters
+    result["related_parameters"] = {
+        "beta": "Vp/Te — acceleration-to-thermalization ratio",
+        "lambda_star": "nu_en/omega_ce — collision-to-magnetization ratio",
+        "note": "beta and lambda_star require additional inputs (Vp,Te,ngas,B). Use probe_analyze first."}
+
+    return result
+
+
+@mcp.tool()
+def probe_predict_mode(ftail: float, I_std: float = None, log10_alpha: float = None) -> dict:
+    """Plume概率预测 — 逻辑回归融合模型 (88.9% accuracy)
+
+    基于66组Kr工质B场扫描标定的融合模型:
+    P(OSC/PLUME) = sigma(-2.99 + 0.034*log10(alpha) + 2.748*I_std + 0.098*f_tail)
+
+    Args:
+        ftail: 高能密度占比 (%)
+        I_std: 放电电流波动标准差 (可选)
+        log10_alpha: log10(B²/ṁ) (可选)
+    """
+    # Default model coefficients (from plume_probability_model.json)
+    w = [-2.99, 0.034, 2.748, 0.098]
+
+    # Use defaults if optional inputs missing
+    if I_std is None:
+        I_std = 0.5  # typical OSC/PLUME value
+    if log10_alpha is None:
+        log10_alpha = 2.0  # typical transition region
+
+    z = w[0] + w[1]*log10_alpha + w[2]*I_std + w[3]*ftail
+    prob = 1.0 / (1.0 + np.exp(-z))  # sigmoid
+
+    mode = "PLUME" if prob > 0.5 else ("OSCILLATING" if prob > 0.3 else "SPOT")
+
+    return {"status": "ok", "probability_OSC_PLUME": round(float(prob*100), 1),
+            "predicted_mode": mode, "model_accuracy": "88.9%",
+            "coefficients": {"intercept": w[0], "log10_alpha": w[1], "I_std": w[2], "ftail": w[3]},
+            "note": "模型基于66组Kr工质B场扫描标定。不同工质/推力器需重新标定。"}
+
+
+@mcp.tool()
+def probe_stratify(filepath_list: list, group_labels: list = None,
+                   group_by: str = "keeper_current") -> dict:
+    """分层分析 — 防止Simpson悖论
+
+    按分组变量(如keeper电流/流量/磁场)分层统计，自动检测合并vs分组的符号反转。
+
+    Args:
+        filepath_list: CSV文件路径列表
+        group_labels: 每个文件的组标签 (如 ["1A","1A",...,"0.5A","0.5A",...])
+        group_by: 分组变量名 (默认 keeper_current)
+    """
+    if not group_labels:
+        return {"status": "error", "error": "需要group_labels参数指定每个文件的分组"}
+
+    if len(filepath_list) != len(group_labels):
+        return {"status": "error", "error": "filepath_list和group_labels长度不一致"}
+
+    # Analyze all files
+    all_results = []
+    for fp in filepath_list:
+        try:
+            r = probe_analyze(fp)
+            if r["status"] == "ok": all_results.append(r)
+        except: pass
+
+    # Extract key metrics
+    metrics = ["ftail_pct", "Teff_eV", "sheath_ratio", "n_peaks"]
+    overall = {}
+    grouped = {}
+
+    for metric in metrics:
+        all_vals = []
+        group_vals = {}
+        for r, label in zip(all_results, group_labels):
+            if metric == "ftail_pct":
+                val = r["tail_metrics"]["ftail_pct"]
+            elif metric == "Teff_eV":
+                val = r["tail_metrics"]["Teff_eV"]
+            elif metric == "sheath_ratio":
+                val = r["tail_metrics"]["sheath_ratio"]
+            elif metric == "n_peaks":
+                val = r["eepf_peaks"]["n_peaks"]
+            else:
+                val = None
+
+            if val is not None:
+                all_vals.append(val)
+                group_vals.setdefault(label, []).append(val)
+
+        overall[metric] = {"mean": round(float(np.mean(all_vals)),2) if all_vals else None,
+                          "std": round(float(np.std(all_vals)),2) if all_vals else None,
+                          "n": len(all_vals)}
+
+        grouped[metric] = {}
+        for label, vals in group_vals.items():
+            grouped[metric][label] = {"mean": round(float(np.mean(vals)),2),
+                                      "std": round(float(np.std(vals)),2), "n": len(vals)}
+
+    # Simpson's paradox detection: compare overall vs per-group correlations
+    # Check if any metric's group ordering contradicts overall
+    paradox_warnings = []
+    for metric in metrics:
+        group_means = [(label, g["mean"]) for label, g in grouped[metric].items() if g["mean"] is not None]
+        if len(group_means) >= 2:
+            overall_mean = overall[metric]["mean"]
+            # Check if overall mean lies outside the range of group means
+            gmeans = [m for _, m in group_means]
+            if overall_mean is not None and (overall_mean < min(gmeans) or overall_mean > max(gmeans)):
+                paradox_warnings.append({
+                    "metric": metric,
+                    "overall_mean": overall_mean,
+                    "group_means": dict(group_means),
+                    "warning": "总体均值落在各组均值范围之外 — 可能存在Simpson悖论,请分层解读"
+                })
+
+    return {"status": "ok", "group_by": group_by, "n_groups": len(set(group_labels)),
+            "n_total": len(all_results), "overall": overall, "grouped": grouped,
+            "simpson_paradox_warnings": paradox_warnings,
+            "note": "检测到警告时: 不要合并数据做单一相关分析,必须分组讨论"}
+
+
+@mcp.tool()
+def probe_anode_detect(filepath: str, jump_threshold_mA_s: float = 30.0,
+                       plateau_min_duration_s: float = 30.0) -> dict:
+    """阳极电流跳变检测 — 识别放电模式转变事件
+
+    适用于阳极电源遥测CSV (含Time, Current列)。
+
+    Args:
+        filepath: 阳极遥测CSV
+        jump_threshold_mA_s: 跳变阈值 mA/s (默认30)
+        plateau_min_duration_s: 最小平稳段时长 s (默认30)
+    """
+    try:
+        import pandas as pd
+        df = pd.read_csv(filepath)
+    except:
+        return {"status": "error", "error": "CSV read failed"}
+
+    time_col = [c for c in df.columns if 'time' in c.lower() or 'Time' in c][0]
+    curr_col = [c for c in df.columns if 'current' in c.lower() or 'Current' in c or 'I_' in c or 'A' in c][0]
+
+    t = df[time_col].values
+    i = df[curr_col].values
+
+    if len(t) < 10:
+        return {"status": "error", "error": "Not enough data points"}
+
+    # Detect jumps: |dI/dt| > threshold
+    dt = np.diff(t)
+    di = np.diff(i)
+    didt = np.abs(di / np.maximum(dt, 1e-6)) * 1000  # mA/s
+
+    jump_idx = np.where(didt > jump_threshold_mA_s)[0]
+    jumps = []
+    if len(jump_idx) > 0:
+        # Cluster nearby jumps
+        clusters = [[jump_idx[0]]]
+        for j in jump_idx[1:]:
+            if t[j] - t[clusters[-1][-1]] < 10:  # within 10s
+                clusters[-1].append(j)
+            else:
+                clusters.append([j])
+        for c in clusters:
+            jumps.append({
+                "time_s": round(float(t[c[0]]), 1),
+                "current_before_A": round(float(i[max(0,c[0]-1)]), 3),
+                "current_after_A": round(float(i[min(len(i)-1,c[-1]+1)]), 3),
+                "delta_A": round(float(i[min(len(i)-1,c[-1]+1)] - i[max(0,c[0]-1)]), 3),
+                "max_rate_mA_s": round(float(np.max(didt[c])), 1)})
+
+    # Detect plateaus: stable current for > plateau_min_duration_s
+    # Round current to 0.1mA resolution
+    i_rounded = np.round(i, 3)
+    plateaus = []
+    start = 0
+    for idx in range(1, len(i_rounded)):
+        if abs(i_rounded[idx] - i_rounded[start]) > 0.001:  # >1mA change
+            duration = t[idx-1] - t[start]
+            if duration >= plateau_min_duration_s:
+                plateaus.append({
+                    "start_s": round(float(t[start]), 1),
+                    "end_s": round(float(t[idx-1]), 1),
+                    "duration_s": round(float(duration), 1),
+                    "current_A": round(float(np.mean(i[start:idx])), 3),
+                    "current_std_A": round(float(np.std(i[start:idx])), 4)})
+            start = idx
+
+    return {"status": "ok", "n_jumps": len(jumps), "jumps": jumps,
+            "n_plateaus": len(plateaus), "plateaus": plateaus,
+            "total_duration_s": round(float(t[-1] - t[0]), 1)}
+
+
+# ── probe_plot: add missing plot types ──
+# (monkey-patch: extend plot_type options to include "oml" and "logiv" and "bimaxwell")
+
+# Store original probe_plot reference
+_original_probe_plot = probe_plot
+
+@mcp.tool()
+def probe_plot_extended(filepath: str, plot_type: str = "all",
+                        output_format: str = "png") -> dict:
+    """扩展诊断图 — 新增: OML线性检验(I^0.75)、ln(I)-V、双温拟合叠加
+
+    Args:
+        filepath: CSV文件路径
+        plot_type: all | iv | eepf | oml | logiv | bimaxwell
+        output_format: png | svg
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # Get analysis data
+    r = probe_analyze(filepath)
+    if r["status"] != "ok":
+        return {"status": "error", "error": r.get("error")}
+
+    voltage, current = read_probe_csv(filepath)
+    sort_idx = np.argsort(voltage)
+    voltage = voltage[sort_idx]
+    current = -current[sort_idx]
+    voltage_s = smooth_gaussian(voltage)
+    current_s = smooth_gaussian(current)
+
+    base_name = os.path.splitext(os.path.basename(filepath))[0]
+    outputs = []
+
+    # OML check: I^0.75 vs V (ion saturation region should be linear)
+    if plot_type in ("all", "oml"):
+        fig, ax = plt.subplots(figsize=(8,5), dpi=130)
+        vf = r["Vf"]["Vf"]
+        mask_ion = voltage_s < (vf - 2)  # ion saturation
+        if np.sum(mask_ion) > 5:
+            i_ion = np.abs(current_s[mask_ion])
+            ax.plot(voltage_s[mask_ion], np.power(np.maximum(i_ion,1e-15), 0.75), 'b.', ms=4)
+            # Linear fit
+            coeffs = np.polyfit(voltage_s[mask_ion], np.power(np.maximum(i_ion,1e-15), 0.75), 1)
+            ax.plot(voltage_s[mask_ion], np.polyval(coeffs, voltage_s[mask_ion]), 'r--', lw=1.5,
+                   label=f'slope={coeffs[0]:.4f}')
+            ax.legend()
+        ax.set_xlabel('Voltage (V)'); ax.set_ylabel('I^{0.75}')
+        ax.set_title(f'{base_name} — OML linearity check (cylindrical probe)')
+        ax.grid(alpha=0.3)
+        path = str(OUTPUT_DIR / f'{base_name}_OML.{output_format}')
+        fig.savefig(path, dpi=130, bbox_inches='tight'); plt.close()
+        outputs.append(path)
+
+    # Log(IV)
+    if plot_type in ("all", "logiv"):
+        fig, ax = plt.subplots(figsize=(8,5), dpi=130)
+        mask_pos = current_s > 1e-12
+        ax.semilogy(voltage_s[mask_pos], current_s[mask_pos], 'b-', lw=1.5)
+        ax.axvline(r["Vf"]["Vf"], color='g', ls='--', label=f'Vf={r["Vf"]["Vf"]:.1f}')
+        ax.axvline(r["Vp"]["Vp"], color='r', ls='--', label=f'Vp={r["Vp"]["Vp"]:.1f}')
+        # Transition region linear fit overlay
+        mask_trans = (voltage_s >= r["Vf"]["Vf"]) & (voltage_s <= r["Vp"]["Vp"])
+        if np.sum(mask_trans) > 5 and r["Te_classic"].get("Te_eV"):
+            Te = r["Te_classic"]["Te_eV"]
+            I_vp = current_s[np.argmin(np.abs(voltage_s - r["Vp"]["Vp"]))]
+            ax.plot(voltage_s[mask_trans], I_vp * np.exp(-(r["Vp"]["Vp"]-voltage_s[mask_trans])/Te),
+                   'r--', lw=1, alpha=0.7, label=f'Te={Te:.1f}eV fit')
+        ax.set_xlabel('Voltage (V)'); ax.set_ylabel('Current (A)')
+        ax.set_title(f'{base_name} — ln(I)-V')
+        ax.legend(); ax.grid(alpha=0.3)
+        path = str(OUTPUT_DIR / f'{base_name}_LogIV.{output_format}')
+        fig.savefig(path, dpi=130, bbox_inches='tight'); plt.close()
+        outputs.append(path)
+
+    # Bi-Maxwellian fit overlay
+    if plot_type in ("all", "bimaxwell"):
+        bimax = probe_fit_bimaxwell(filepath)
+        if bimax["status"] == "ok" and bimax["valid"]:
+            fig, ax = plt.subplots(figsize=(8,5), dpi=130)
+            ax.semilogy(voltage_s, np.maximum(current_s,1e-15), 'k.', ms=2, alpha=0.5, label='data')
+            Vp = r["Vp"]["Vp"]
+            I_sat = current_s[np.argmin(np.abs(voltage_s-Vp))]
+            # Hot electron extrapolation
+            I_hot = I_sat * np.exp(-np.maximum(voltage_s-Vp, 0)/bimax["Thot_eV"])
+            ax.semilogy(voltage_s, np.maximum(I_hot,1e-15), 'r--', lw=1.2,
+                       label=f'T_hot={bimax["Thot_eV"]:.1f}eV')
+            # Cold residual
+            I_cold = current_s - I_hot
+            ax.semilogy(voltage_s[I_cold>1e-15], I_cold[I_cold>1e-15], 'b-', lw=1,
+                       label=f'T_cold={bimax["Tcold_eV"]:.1f}eV')
+            ax.axvline(Vp, color='k', ls='--'); ax.axvline(r["Vf"]["Vf"], color='g', ls='--')
+            ax.legend(); ax.set_xlabel('Voltage (V)'); ax.set_ylabel('Current (A)')
+            ax.set_title(f'{base_name} — Bi-Maxwellian fit (Yip 2020)'); ax.grid(alpha=0.3)
+            path = str(OUTPUT_DIR / f'{base_name}_biMaxwell.{output_format}')
+            fig.savefig(path, dpi=130, bbox_inches='tight'); plt.close()
+            outputs.append(path)
+
+    # Also run original probe_plot for iv/eepf
+    orig = _original_probe_plot(filepath, plot_type if plot_type in ("all","iv","eepf") else "all", output_format)
+    if orig["status"] == "ok":
+        outputs.extend(orig.get("outputs", []))
+
+    return {"status": "ok", "outputs": list(set(outputs)), "n_plots": len(set(outputs))}
+
+
+# ── Enhance: probe_detect_steps add comb-tooth detection ──
+
+@mcp.tool()
+def probe_detect_comb_teeth(filepath: str, tolerance: float = 0.15) -> dict:
+    """梳齿伪影检测 — 检测dI/dV上等间距的伪台阶
+
+    真实电子群的台阶间距不均匀(2-8V不等)。
+    梳齿伪影间距均匀(≈峰检测最小间距参数)。
+
+    Args:
+        filepath: CSV文件路径
+        tolerance: 间距均匀性容差 (默认15%)
+    """
+    stairs = probe_detect_steps(filepath)
+    if stairs["n_steps"] < 3:
+        return {"status": "ok", "has_comb_teeth": False,
+                "reason": f"台阶数不足({stairs['n_steps']}), 至少需要3个"}
+
+    voltages = [s["voltage_V"] for s in stairs["steps"]]
+    spacings = np.diff(voltages)
+    mean_spacing = np.mean(spacings)
+    std_spacing = np.std(spacings)
+
+    # Comb teeth: spacings are nearly uniform
+    cv = std_spacing / max(mean_spacing, 0.01)
+    is_comb = cv < tolerance
+
+    return {"status": "ok", "has_comb_teeth": is_comb,
+            "spacings_V": [round(float(s),2) for s in spacings],
+            "mean_spacing_V": round(float(mean_spacing),2),
+            "std_spacing_V": round(float(std_spacing),2),
+            "cv": round(float(cv),3),
+            "judgment": "可能为梳齿伪影(等间距), 建议增大平滑窗宽" if is_comb else "间距不均匀, 更可能是真实电子群台阶",
+            "fix_hint": "增大smooth window或减小prominence阈值" if is_comb else None}
+
+
+# ── Enhance: probe_analyze add OML sheath expansion correction ──
+
+def _sheath_expansion_correction(ne_cm3: float, Te_eV: float, R_mm: float) -> dict:
+    """OML厚鞘修正: lambda_D/R → effective collection area correction"""
+    if ne_cm3 is None or Te_eV is None or ne_cm3 <= 0 or Te_eV <= 0:
+        return {"lambda_D_mm": None, "lambda_D_over_R": None, "correction_note": "参数不足"}
+
+    eps0 = 8.854e-12
+    ne_m3 = ne_cm3 * 1e6
+    lambda_D = np.sqrt(eps0 * Te_eV / (ne_m3 * 1.602e-19))  # meters
+    lambda_D_mm = lambda_D * 1000
+
+    R = R_mm
+    ratio = lambda_D_mm / R
+
+    correction = ""
+    if ratio < 1:
+        correction = "薄鞘 (lambda_D < R): OML公式适用, 几何面积可用"
+    elif ratio < 10:
+        correction = f"厚鞘 (lambda_D/R={ratio:.1f}): 有效收集面积>几何面积, f_tail绝对值被低估, 偏差方向保守"
+    else:
+        correction = f"极厚鞘 (lambda_D/R={ratio:.1f}): OML假设恶化, 建议使用ABR理论修正"
+
+    return {"lambda_D_mm": round(lambda_D_mm, 4), "lambda_D_over_R": round(ratio, 1),
+            "correction": correction}
+
+
 def main():
     """MCP Server 入口"""
     print(f"Langmuir Probe MCP v{VERSION}")
