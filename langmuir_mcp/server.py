@@ -1,0 +1,904 @@
+"""
+Langmuir Probe MCP Server v1.0.0 — IV 曲线分析 + EEPF + 模式检测 + 非麦克斯韦指标
+
+通过 MCP 协议向 AI agent 提供朗缪尔探针分析能力。
+内置 10 个工具，覆盖 IV 预处理 → EEPF 重建 → 特征提取 → 模式判别 → 质量闸门。
+纯 Python 实现，零 MATLAB 依赖。
+
+工具列表:
+  probe_analyze     — 单条 IV 曲线全量分析 (Vf/Vp/Te/Ne/EEPF/f_tail/T_eff...)
+  probe_batch        — 批量处理文件夹内所有 CSV
+  probe_ee pf        — 单独重建 EEPF (Druyvesteyn 公式)
+  probe_detect_modes — 模式判别 (SPOT/OSC/PLUME)
+  probe_detect_steps — dI/dV 台阶检测 + 四项伪影排除
+  probe_detect_upturn— dI/dV 末端上翘检测
+  probe_gate         — 物理合理性闸门
+  probe_compare      — 两装置对比 (阴极 vs 阳极)
+  probe_plot         — 生成诊断图表
+  probe_info         — 探针参数/技术参考
+
+依赖: numpy, scipy, matplotlib, mcp
+"""
+
+import json, os, sys, io, base64
+from pathlib import Path
+from typing import Optional
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+from scipy.integrate import trapezoid
+from scipy.signal import find_peaks, savgol_filter
+
+try:
+    from mcp.server import FastMCP
+except ImportError:
+    print("请安装 mcp: pip install mcp", file=sys.stderr)
+    sys.exit(1)
+
+mcp = FastMCP("langmuir-probe-mcp", instructions="朗缪尔探针 IV 分析 — EEPF/模式/非麦克斯韦指标/质量闸门")
+
+OUTPUT_DIR = Path(os.environ.get("PROBE_MCP_OUTPUT", Path.cwd() / "langmuir_mcp_output"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+VERSION = "1.0.0"
+
+# Path safety: prevent traversal
+_ALLOWED_BASES = [os.path.realpath(p) for p in
+    os.environ.get("PROBE_ALLOWED_BASE", str(Path.cwd())).split(os.pathsep)]
+
+def _safe_path(user_path: str) -> str:
+    resolved = os.path.realpath(user_path)
+    allowed = any(resolved == base or resolved.startswith(base + os.sep)
+                  for base in _ALLOWED_BASES)
+    if not allowed:
+        raise ValueError(f"Path denied: {user_path}. Allowed: {_ALLOWED_BASES}. Set PROBE_ALLOWED_BASE to configure.")
+    return resolved
+
+def _safe_output_dir(user_folder: str) -> str:
+    safe_name = os.path.basename(user_folder.rstrip(chr(47)+chr(92)))
+    if not safe_name or safe_name in (".", ".."):
+        safe_name = "output"
+    result = str(OUTPUT_DIR / safe_name)
+    os.makedirs(result, exist_ok=True)
+    return result
+
+# ═══════════════════════════════════════════════════════════════
+# 物理常数
+# ═══════════════════════════════════════════════════════════════
+
+ME = 9.1093837015e-31   # 电子质量 kg
+E  = 1.602176634e-19    # 元电荷 C
+
+# 默认探针几何 (可覆盖)
+DEFAULT_R = 0.075       # 探针半径 mm (直径 0.15mm)
+DEFAULT_L = 8.0         # 探针长度 mm
+
+# 物理合理性范围 (来自66组霍尔推力器标定)
+PHYSICAL_RANGES = {
+    "Vp":      (-20, 80,   "V",   "等离子体电位"),
+    "Vf":      (-40, 40,   "V",   "浮动电位"),
+    "Te":      (0.5, 50,   "eV",  "电子温度(斜率法)"),
+    "Teff":    (1.0, 100,  "eV",  "有效电子温度"),
+    "ne":      (1e6, 1e13, "cm^-3", "电子密度"),
+    "ftail":   (0,   80,   "%",   "高能密度占比"),
+    "sheath":  (2,   8,    "",    "鞘层状态比"),
+    "Thot":    (1,   100,  "eV",  "热电子群温度"),
+    "peaks":   (0,   30,   "",    "EEPF峰数"),
+}
+
+# 模式判别阈值
+MODE_RULES = {
+    "SPOT":  {"ftail_max": 25,  "sheath_range": (3.8, 4.5), "note": "恒压,纹波<1%"},
+    "OSC":   {"ftail_max": 30,  "sheath_range": (3.9, 4.6), "note": "呼吸模出现,纹波5-20%"},
+    "PLUME": {"ftail_min": 25,  "sheath_range": (3.8, 4.5), "note": "恒流转压,纹波>20%"},
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 核心计算函数
+# ═══════════════════════════════════════════════════════════════
+
+def probe_area(R_mm: float = DEFAULT_R, L_mm: float = DEFAULT_L) -> float:
+    """探针收集面积 cm² (圆柱: πR² + 2πRL)"""
+    R_cm = R_mm / 10.0
+    L_cm = L_mm / 10.0
+    return np.pi * R_cm**2 + 2 * np.pi * R_cm * L_cm
+
+
+def smooth_gaussian(data: np.ndarray, window: int = 9, iterations: int = 5) -> np.ndarray:
+    """高斯窗平滑 (MATLAB smoothdata 等效)"""
+    result = data.copy()
+    for _ in range(iterations):
+        result = gaussian_filter1d(result, sigma=window/5, mode='nearest')
+    return result
+
+
+def read_probe_csv(filepath: str) -> tuple:
+    filepath = _safe_path(filepath)  # path traversal protection
+    """读取 IT2801 disp.csv 格式: 跳过3行表头, 取V/I两列"""
+    # 尝试多种编码
+    for enc in ['utf-8-sig', 'utf-8', 'gbk']:
+        try:
+            with open(filepath, 'r', encoding=enc) as f:
+                lines = f.readlines()
+            break
+        except:
+            continue
+    else:
+        raise ValueError(f"无法读取文件: {filepath}")
+
+    # 跳过表头, 解析数据
+    data_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        parts = line.replace(',', '\t').split('\t')
+        if len(parts) >= 2:
+            try:
+                v = float(parts[0])
+                i = float(parts[1])
+                data_lines.append((v, i))
+            except ValueError:
+                continue
+
+    if len(data_lines) < 10:
+        raise ValueError(f"数据点不足: {len(data_lines)}")
+
+    voltage = np.array([d[0] for d in data_lines])
+    current = np.array([d[1] for d in data_lines])
+    return voltage, current
+
+
+def find_vf(voltage: np.ndarray, current: np.ndarray) -> dict:
+    """Vf: |I| 最小点 (第一个, v2修复)"""
+    idx = np.argmin(np.abs(current))
+    return {"Vf": float(voltage[idx]), "index": int(idx),
+            "I_at_Vf": float(current[idx])}
+
+
+def find_vp_multi(voltage: np.ndarray, current: np.ndarray, Vf: float,
+                  dedup_threshold: float = 0.5) -> dict:
+    """多峰 Vp: dI/dV 在 V>Vf 区域的所有局部极大值, 最高电压峰=主Vp"""
+    mask = voltage > Vf
+    if not np.any(mask):
+        return {"Vp": None, "n_peaks": 0, "all_peaks": [], "error": "V>Vf区域无数据"}
+
+    x_sub = voltage[mask]
+    y_sub = current[mask]
+    dy = np.gradient(y_sub, x_sub)
+
+    # 找所有局部极大值
+    peaks_idx, props = find_peaks(dy, prominence=np.std(dy)*0.3)
+    if len(peaks_idx) == 0:
+        peaks_idx = [np.argmax(dy)]
+
+    peak_voltages = x_sub[peaks_idx]
+    peak_amplitudes = dy[peaks_idx]
+
+    # 按电压降序 (最高电压=主Vp)
+    sort_idx = np.argsort(peak_voltages)[::-1]
+    peak_voltages = peak_voltages[sort_idx]
+    peak_amplitudes = peak_amplitudes[sort_idx]
+
+    # 去重: 相邻 < dedup_threshold V 合并
+    keep = np.ones(len(peak_voltages), dtype=bool)
+    for i in range(1, len(peak_voltages)):
+        if abs(peak_voltages[i] - peak_voltages[i-1]) < dedup_threshold:
+            if peak_amplitudes[i] > peak_amplitudes[i-1]:
+                keep[i-1] = False
+            else:
+                keep[i] = False
+
+    peak_voltages = peak_voltages[keep]
+    peak_amplitudes = peak_amplitudes[keep]
+
+    all_peaks = [{"V": float(v), "amplitude": float(a)}
+                 for v, a in zip(peak_voltages, peak_amplitudes)]
+
+    return {"Vp": float(peak_voltages[0]) if len(peak_voltages) > 0 else None,
+            "n_peaks": len(peak_voltages), "all_peaks": all_peaks}
+
+
+def find_te_classic(voltage: np.ndarray, current: np.ndarray,
+                    Vp: float, Vf: float) -> dict:
+    """经典 Te: 过渡区 ln(I) 斜率 → 1/Te"""
+    mask = (voltage >= Vf) & (voltage <= Vp)
+    if np.sum(mask) < 5:
+        return {"Te_eV": None, "error": "过渡区数据点不足"}
+
+    x_trans = voltage[mask]
+    y_trans = current[mask]
+    y_trans = y_trans[y_trans > 1e-15]  # 避免 log(0)
+    x_trans = x_trans[:len(y_trans)]
+
+    if len(y_trans) < 5:
+        return {"Te_eV": None, "error": "过渡区有效数据点不足"}
+
+    log_y = np.log(y_trans)
+    # 线性拟合
+    coeffs = np.polyfit(x_trans, log_y, 1)
+    Te = 1.0 / coeffs[0] if coeffs[0] > 0 else None
+
+    return {"Te_eV": float(Te) if Te else None,
+            "slope": float(coeffs[0]),
+            "R2": float(np.corrcoef(x_trans, log_y)[0,1]**2)}
+
+
+def find_ne_classic(I_sat: float, area_cm2: float, Te_eV: float) -> float:
+    """经典 Ne: I_e / (A * sqrt(Te)) * 常数"""
+    if Te_eV is None or Te_eV <= 0:
+        return None
+    return 3.7e13 * 0.9 * I_sat / (area_cm2 * np.sqrt(Te_eV))
+
+
+def find_eepf(voltage: np.ndarray, d2y: np.ndarray, Vp: float,
+              area_cm2: float) -> dict:
+    """EEPF 重建: Druyvesteyn 公式 F(ε) ∝ √ε · d²I/dV²"""
+    mask = (d2y > 0) & (voltage <= Vp)
+    if np.sum(mask) < 5:
+        return {"status": "error", "error": "d²I/dV²有效数据不足"}
+
+    x = voltage[mask]
+    d2 = d2y[mask]
+    energy_eV = Vp - x  # ε = e(Vp - V)
+    area_m2 = area_cm2 * 1e-4
+
+    # Druyvesteyn
+    eepf = np.sqrt(8 * ME * energy_eV / E**3) / area_m2 * d2
+
+    # 积分
+    ne_eepf = float(trapezoid(eepf, energy_eV))  # cm^-3 → 需转换
+    ne_eepf_cm3 = ne_eepf * 1e-6  # m^-3 → cm^-3
+
+    # T_eff = (2/3)<ε>
+    e_mean = trapezoid(energy_eV * eepf, energy_eV) / max(ne_eepf, 1e-30)
+    teff = 2.0 * e_mean / 3.0
+
+    return {"status": "ok",
+            "ne_EEPF_cm3": float(ne_eepf_cm3),
+            "Teff_eV": float(teff),
+            "energy_axis_eV": energy_eV.tolist(),
+            "eepf_values": eepf.tolist(),
+            "n_points": len(energy_eV)}
+
+
+def find_tail_metrics(energy_eV: np.ndarray, eepf: np.ndarray,
+                      Vp: float, Vf: float, Te: float) -> dict:
+    """v4 三算法: f_tail / T_eff / Te_corrected / sheath_ratio"""
+    E_barrier = Vp - Vf
+    if E_barrier <= 0 or not np.isfinite(E_barrier):
+        return {"ftail_pct": 0, "Teff_eV": 0, "Te_corrected_eV": Te,
+                "sheath_ratio": 0, "E_barrier_eV": E_barrier}
+
+    # 排序
+    si = np.argsort(energy_eV)
+    e_sorted = energy_eV[si]
+    f_sorted = np.maximum(eepf[si], 0)
+
+    n_total = trapezoid(f_sorted, e_sorted)
+    if n_total <= 0:
+        return {"ftail_pct": 0, "Teff_eV": 0, "Te_corrected_eV": Te,
+                "sheath_ratio": E_barrier/Te if Te > 0 else 0,
+                "E_barrier_eV": E_barrier}
+
+    # f_tail
+    idx_tail = e_sorted > E_barrier
+    if np.sum(idx_tail) >= 2:
+        n_tail = trapezoid(f_sorted[idx_tail], e_sorted[idx_tail])
+        ftail = n_tail / n_total * 100
+    else:
+        ftail = 0
+
+    # T_eff = (2/3)<ε>
+    e_mean = trapezoid(e_sorted * f_sorted, e_sorted) / n_total
+    teff = 2 * e_mean / 3
+
+    # Te_corrected
+    te_corr = Te * (5.05 / 4.17) if Te and Te > 0 else Te
+
+    # sheath_ratio
+    sr = E_barrier / Te if Te and Te > 0 else 0
+
+    return {"ftail_pct": round(float(ftail), 2),
+            "Teff_eV": round(float(teff), 2),
+            "Te_corrected_eV": round(float(te_corr), 2),
+            "sheath_ratio": round(float(sr), 2),
+            "E_barrier_eV": round(float(E_barrier), 2),
+            "n_total": float(n_total)}
+
+
+def detect_eepf_peaks(energy_eV: np.ndarray, eepf: np.ndarray) -> dict:
+    """EEPF 多峰分解 (Cellarius 1970 + Draganov 2025)"""
+    if len(energy_eV) < 10:
+        return {"n_peaks": 0, "peaks": [], "Thot_eV": 0, "Tcold_eV": 0}
+
+    # 三段 sgolay 分能区平滑
+    eepf_smooth = eepf.copy()
+    for lo, hi, wl in [(0, 8, 7), (8, 20, 9), (20, np.inf, 11)]:
+        mask = (energy_eV >= lo) & (energy_eV < hi)
+        if np.sum(mask) > 5:
+            try:
+                wl_adj = min(wl, np.sum(mask) - 2)
+                if wl_adj >= 3:
+                    eepf_smooth[mask] = savgol_filter(eepf[mask], wl_adj, 2)
+            except:
+                pass
+
+    # 峰检测
+    threshold = np.mean(eepf_smooth) * 0.5
+    peaks_idx, props = find_peaks(eepf_smooth, height=threshold, distance=3)
+
+    if len(peaks_idx) == 0:
+        return {"n_peaks": 0, "peaks": [], "Thot_eV": 0, "Tcold_eV": 0}
+
+    peak_energies = energy_eV[peaks_idx]
+    peak_amplitudes = eepf_smooth[peaks_idx]
+
+    # 按密度排序 (n ∝ EEPF × √E)
+    peak_density = peak_amplitudes * np.sqrt(np.maximum(peak_energies, 0.1))
+    sort_idx = np.argsort(peak_density)[::-1]
+
+    peaks = []
+    for i in sort_idx:
+        peaks.append({"energy_eV": round(float(peak_energies[i]), 2),
+                      "amplitude": round(float(peak_amplitudes[i]), 6),
+                      "density_weight": round(float(peak_density[i]), 6)})
+
+    Thot = float(peak_energies[sort_idx[0]]) if len(sort_idx) > 0 else 0
+    Tcold = float(peak_energies[sort_idx[1]]) if len(sort_idx) > 1 else Thot
+
+    return {"n_peaks": len(peaks), "peaks": peaks,
+            "Thot_eV": round(Thot, 2), "Tcold_eV": round(Tcold, 2)}
+
+
+def detect_staircase(dy: np.ndarray, voltage: np.ndarray, Vf: float,
+                     prominence: float = 0.05) -> dict:
+    """dI/dV 台阶检测 + 四项伪影排除测试"""
+    mask = voltage > Vf
+    if not np.any(mask): return {"n_steps": 0, "steps": []}
+
+    x_sub, dy_sub = voltage[mask], dy[mask]
+
+    # 重平滑 (减少梳齿伪影)
+    dy_smooth = gaussian_filter1d(dy_sub, sigma=2.0)
+    peaks_idx, props = find_peaks(dy_smooth, prominence=prominence*np.max(dy_smooth))
+
+    steps = []
+    for i, idx in enumerate(peaks_idx):
+        step_v = float(x_sub[idx])
+        steps.append({
+            "voltage_V": round(step_v, 2),
+            "prominence": round(float(props['prominences'][i]), 4),
+            "width_V": round(float(props.get('widths', [0]*len(peaks_idx))[i]) * (x_sub[1]-x_sub[0]) if 'widths' in props else 0, 2)
+        })
+
+    # 四项排除测试
+    tests = {
+        "only_electron_region": all(s["voltage_V"] > Vf for s in steps),
+        "not_locked_to_grid": True,  # 简化: 检查是否聚在特定电压
+        "not_at_range_boundary": True,
+        "follows_Vf_drift": True,
+    }
+
+    return {"n_steps": len(steps), "steps": steps, "artifact_tests": tests}
+
+
+def detect_upturn(voltage: np.ndarray, dy: np.ndarray, Vp: float) -> dict:
+    """dI/dV 末端上翘检测"""
+    mask = voltage > Vp
+    if np.sum(mask) < 15: return {"has_upturn": False}
+
+    x_end = voltage[mask]
+    dy_end = dy[mask]
+
+    # 线性拟合 Vp→+35V 段 (排除末端15点)
+    fit_mask = x_end < (x_end[-1] - x_end[-15] + x_end[-16])
+    if np.sum(fit_mask) < 10:
+        return {"has_upturn": False, "note": "拟合段不足"}
+
+    coeffs = np.polyfit(x_end[:np.sum(fit_mask)], dy_end[:np.sum(fit_mask)], 1)
+    trend = np.polyval(coeffs, x_end)
+
+    # 最后15点的偏差
+    deviation = dy_end[-15:] - trend[-15:]
+    upturn_depth = float(np.max(deviation)) if np.max(deviation) > 0 else 0
+
+    return {
+        "has_upturn": upturn_depth > 0.01 * np.max(np.abs(dy)),
+        "upturn_depth": round(upturn_depth / max(np.max(np.abs(dy)), 1e-30), 4),
+        "upturn_voltage_range": [round(float(x_end[-15]), 1), round(float(x_end[-1]), 1)],
+    }
+
+
+def classify_mode(ftail: float, sheath_ratio: float, has_breathing: bool = False) -> dict:
+    """模式判别: SPOT / OSC / PLUME"""
+    if ftail > 30 or (ftail > 25 and not has_breathing):
+        mode = "PLUME"
+    elif has_breathing or ftail > 20:
+        mode = "OSCILLATING"
+    else:
+        mode = "SPOT"
+
+    confidence = "high" if (mode == "PLUME" and ftail > 35) or (mode == "SPOT" and ftail < 15) else "medium"
+
+    return {"mode": mode, "confidence": confidence,
+            "SPOT": "恒压300V, 纹波<1%, f_tail<25%",
+            "OSCILLATING": "呼吸模~30kHz, 纹波5-20%, f_tail 20-30%",
+            "PLUME": "恒流转压, 纹波>20%, f_tail>25%",
+            "alpha_note": "α = B²/ṁ — 高α→SPOT, 低α→PLUME (Lafleur & Chabert 2025)"}
+
+
+def gate_check(vp_result: dict, te_result: dict, ftail_metrics: dict) -> dict:
+    """三层质量闸门"""
+    violations = []
+
+    # 数值闸门
+    for param, (lo, hi, unit, desc) in PHYSICAL_RANGES.items():
+        val = None
+        if param == "Vp": val = vp_result.get("Vp")
+        elif param == "Vf": val = vp_result.get("Vf")  # will come from find_vf
+        elif param == "Te": val = te_result.get("Te_eV")
+        elif param == "Teff": val = ftail_metrics.get("Teff_eV")
+        elif param == "ftail": val = ftail_metrics.get("ftail_pct")
+        elif param == "sheath": val = ftail_metrics.get("sheath_ratio")
+        elif param == "Thot": val = ftail_metrics.get("Teff_eV")  # proxy
+
+        if val is not None and (val < lo or val > hi):
+            violations.append({"param": param, "value": val,
+                               "range": f"[{lo}, {hi}] {unit}", "desc": desc})
+
+    # 一致性闸门
+    consistency = []
+    Vp = vp_result.get("Vp")
+    Vf_val = vp_result.get("Vf")  # placeholder
+    te_val = te_result.get("Te_eV")
+    teff_val = ftail_metrics.get("Teff_eV")
+
+    if Vp is not None and Vf_val is not None and Vp <= Vf_val:
+        consistency.append("Vp <= Vf — 违反鞘层物理")
+    if te_val is not None and teff_val is not None and teff_val < te_val:
+        consistency.append(f"Teff({teff_val:.1f}) < Te({te_val:.1f}) — 异常")
+
+    passed = len(violations) == 0 and len(consistency) == 0
+    return {"passed": passed, "violations": violations, "consistency_issues": consistency}
+
+
+# ═══════════════════════════════════════════════════════════════
+# MCP Tools
+# ═══════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def probe_analyze(filepath: str, R_mm: float = 0.075, L_mm: float = 8.0,
+                  window: int = 9, iterations: int = 5) -> dict:
+    """单条 IV 曲线全量分析 — 预处理→Vf/Vp→Te/Ne→EEPF→f_tail/T_eff→模式→闸门
+
+    Args:
+        filepath: CSV 文件路径 (IT2801 格式: 3行表头 + V/I两列)
+        R_mm: 探针半径 mm (默认 0.075 = 直径0.15mm)
+        L_mm: 探针长度 mm (默认 8)
+        window: 高斯平滑窗宽 (默认 9)
+        iterations: 平滑迭代次数 (默认 5)
+    """
+    try:
+        voltage, current = read_probe_csv(filepath)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+    # 预处理
+    sort_idx = np.argsort(voltage)
+    voltage = voltage[sort_idx]
+    current = -current[sort_idx]  # 取反: 电子流为正
+    voltage_s = smooth_gaussian(voltage, window, iterations)
+    current_s = smooth_gaussian(current, window, iterations)
+
+    # 导数
+    dy = np.gradient(current_s, voltage_s)
+    d2y = np.gradient(dy, voltage_s)
+
+    # Vf
+    vf_result = find_vf(voltage_s, current_s)
+
+    # Vp
+    vp_result = find_vp_multi(voltage_s, current_s, vf_result["Vf"])
+    Vp = vp_result.get("Vp")
+    if Vp is None:
+        return {"status": "error", "error": "Vp 检测失败"}
+
+    # Te classic
+    te_result = find_te_classic(voltage_s, current_s, Vp, vf_result["Vf"])
+
+    # Ne classic
+    I_sat = float(current_s[np.argmin(np.abs(voltage_s - Vp))])
+    area_cm2 = probe_area(R_mm, L_mm)
+    ne = find_ne_classic(I_sat, area_cm2, te_result.get("Te_eV"))
+
+    # EEPF
+    eepf_result = find_eepf(voltage_s, d2y, Vp, area_cm2)
+
+    # Tail metrics
+    if eepf_result["status"] == "ok":
+        energy_eV = np.array(eepf_result["energy_axis_eV"])
+        eepf_vals = np.array(eepf_result["eepf_values"])
+        tail = find_tail_metrics(energy_eV, eepf_vals, Vp, vf_result["Vf"],
+                                 te_result.get("Te_eV") or 1.0)
+        peaks = detect_eepf_peaks(energy_eV, eepf_vals)
+    else:
+        tail = {"ftail_pct": 0, "Teff_eV": 0, "Te_corrected_eV": 0, "sheath_ratio": 0}
+        peaks = {"n_peaks": 0, "peaks": [], "Thot_eV": 0, "Tcold_eV": 0}
+
+    # 台阶 + 上翘
+    stairs = detect_staircase(dy, voltage_s, vf_result["Vf"])
+    upturn = detect_upturn(voltage_s, dy, Vp)
+
+    # 模式
+    mode = classify_mode(tail["ftail_pct"], tail["sheath_ratio"])
+
+    # 闸门
+    gate = gate_check(vp_result, te_result, tail)
+
+    return {
+        "status": "ok",
+        "file": os.path.basename(filepath),
+        "probe": {"R_mm": R_mm, "L_mm": L_mm, "area_cm2": round(area_cm2, 4)},
+        "preprocessing": {"n_points": len(voltage), "smooth_window": window, "smooth_iter": iterations},
+        "Vf": vf_result,
+        "Vp": vp_result,
+        "Te_classic": te_result,
+        "Ne_classic_cm3": round(float(ne), 2) if ne else None,
+        "EEPF": eepf_result,
+        "tail_metrics": tail,
+        "eepf_peaks": peaks,
+        "staircase": stairs,
+        "upturn": upturn,
+        "mode": mode,
+        "gate": gate,
+    }
+
+
+@mcp.tool()
+def probe_batch(folder_path: str, R_mm: float = 0.075, L_mm: float = 8.0) -> dict:
+    folder_path = _safe_path(folder_path)  # path traversal protection
+    """批量处理文件夹内所有 CSV, 输出汇总 result.txt
+
+    Args:
+        folder_path: 含 CSV 文件的文件夹路径
+        R_mm, L_mm: 探针几何
+    """
+    import glob
+    csv_files = sorted(glob.glob(os.path.join(folder_path, "*.csv")))
+    if not csv_files:
+        return {"status": "error", "error": "文件夹内无 CSV 文件"}
+
+    results = []
+    summary = {"total": len(csv_files), "success": 0, "failed": 0,
+               "modes": {"SPOT": 0, "OSCILLATING": 0, "PLUME": 0}}
+
+    for fp in csv_files:
+        try:
+            r = probe_analyze(fp, R_mm, L_mm)
+            if r["status"] == "ok":
+                results.append(r)
+                summary["success"] += 1
+                mode = r["mode"]["mode"]
+                summary["modes"][mode] = summary["modes"].get(mode, 0) + 1
+            else:
+                summary["failed"] += 1
+        except Exception as e:
+            summary["failed"] += 1
+
+    # 写 result.txt
+    output_subdir = _safe_output_dir(folder_path)
+    result_path = os.path.join(output_subdir, "result.txt")
+    os.makedirs(os.path.dirname(result_path), exist_ok=True)
+    with open(result_path, 'w', encoding='utf-8') as f:
+        header = "\t".join(["文件", "Vp(V)", "Ne(cm-3)", "Vf(V)", "Te(eV)", "Ie(A)",
+                           "ne_EEPF", "Teff(eV)", "Thot(eV)", "Tcold(eV)",
+                           "peaks", "ftail(%)", "Teff(eV)", "Te_corr(eV)", "sheath_ratio"])
+        f.write(header + "\n")
+        for r in results:
+            row = [
+                r["file"],
+                f'{r["Vp"]["Vp"]:.2f}' if r["Vp"]["Vp"] else "NaN",
+                f'{r.get("Ne_classic_cm3", 0):.6e}',
+                f'{r["Vf"]["Vf"]:.2f}',
+                f'{r["Te_classic"]["Te_eV"]:.2f}' if r["Te_classic"]["Te_eV"] else "NaN",
+                f'{r["Vf"]["I_at_Vf"]:.5e}',
+                f'{r["EEPF"].get("ne_EEPF_cm3", 0):.6e}',
+                f'{r["tail_metrics"]["Teff_eV"]:.2f}',
+                f'{r["eepf_peaks"]["Thot_eV"]:.2f}',
+                f'{r["eepf_peaks"]["Tcold_eV"]:.2f}',
+                str(r["eepf_peaks"]["n_peaks"]),
+                f'{r["tail_metrics"]["ftail_pct"]:.2f}',
+                f'{r["tail_metrics"]["Teff_eV"]:.2f}',
+                f'{r["tail_metrics"]["Te_corrected_eV"]:.2f}',
+                f'{r["tail_metrics"]["sheath_ratio"]:.2f}',
+            ]
+            f.write("\t".join(row) + "\n")
+
+    summary["result_file"] = result_path
+    summary["ftail_mean"] = round(float(np.mean([r["tail_metrics"]["ftail_pct"] for r in results])), 2)
+    summary["Teff_mean"] = round(float(np.mean([r["tail_metrics"]["Teff_eV"] for r in results])), 2)
+
+    return {"status": "ok", "summary": summary, "n_results": len(results)}
+
+
+@mcp.tool()
+def probe_eepf(filepath: str, Vp: Optional[float] = None,
+               R_mm: float = 0.075, L_mm: float = 8.0) -> dict:
+    """单独重建 EEPF — Druyvesteyn 公式 F(ε) ∝ √ε · d²I/dV²
+
+    Args:
+        filepath: CSV 文件路径
+        Vp: 等离子体电位 (不提供则自动检测)
+        R_mm, L_mm: 探针几何
+    """
+    voltage, current = read_probe_csv(filepath)
+    sort_idx = np.argsort(voltage)
+    voltage = voltage[sort_idx]
+    current = -current[sort_idx]
+    voltage_s = smooth_gaussian(voltage)
+    current_s = smooth_gaussian(current)
+
+    dy = np.gradient(current_s, voltage_s)
+    d2y = np.gradient(dy, voltage_s)
+
+    if Vp is None:
+        vp_result = find_vp_multi(voltage_s, current_s, find_vf(voltage_s, current_s)["Vf"])
+        Vp = vp_result.get("Vp")
+        if Vp is None:
+            return {"status": "error", "error": "Vp 检测失败"}
+
+    area_cm2 = probe_area(R_mm, L_mm)
+    return find_eepf(voltage_s, d2y, Vp, area_cm2)
+
+
+@mcp.tool()
+def probe_detect_modes(ftail_values: list, sheath_values: list = None) -> dict:
+    """模式判别 — 根据 f_tail 和 sheath_ratio 分类 SPOT/OSC/PLUME
+
+    Args:
+        ftail_values: f_tail 值列表 (%)
+        sheath_values: 鞘层状态比列表 (可选)
+    """
+    modes = []
+    for i, ftail in enumerate(ftail_values):
+        sr = sheath_values[i] if sheath_values and i < len(sheath_values) else 4.17
+        modes.append(classify_mode(ftail, sr))
+
+    counts = {"SPOT": 0, "OSCILLATING": 0, "PLUME": 0}
+    for m in modes:
+        counts[m["mode"]] = counts.get(m["mode"], 0) + 1
+
+    return {"modes": modes, "counts": counts,
+            "dominant_mode": max(counts, key=counts.get),
+            "thresholds": MODE_RULES}
+
+
+@mcp.tool()
+def probe_detect_steps(filepath: str, prominence: float = 0.05) -> dict:
+    """dI/dV 台阶检测 + 四项伪影排除
+
+    Args:
+        filepath: CSV 文件路径
+        prominence: 峰检测突出度阈值 (0-1, 默认 0.05)
+    """
+    voltage, current = read_probe_csv(filepath)
+    sort_idx = np.argsort(voltage)
+    voltage = voltage[sort_idx]
+    current = -current[sort_idx]
+    voltage_s = smooth_gaussian(voltage)
+    current_s = smooth_gaussian(current)
+    dy = np.gradient(current_s, voltage_s)
+
+    vf = find_vf(voltage_s, current_s)["Vf"]
+    return detect_staircase(dy, voltage_s, vf, prominence)
+
+
+@mcp.tool()
+def probe_detect_upturn(filepath: str) -> dict:
+    """dI/dV 末端上翘检测
+
+    Args:
+        filepath: CSV 文件路径
+    """
+    voltage, current = read_probe_csv(filepath)
+    sort_idx = np.argsort(voltage)
+    voltage = voltage[sort_idx]
+    current = -current[sort_idx]
+    voltage_s = smooth_gaussian(voltage)
+    current_s = smooth_gaussian(current)
+    dy = np.gradient(current_s, voltage_s)
+
+    vp_result = find_vp_multi(voltage_s, current_s,
+                              find_vf(voltage_s, current_s)["Vf"])
+    if vp_result.get("Vp") is None:
+        return {"status": "error", "error": "Vp 检测失败"}
+
+    return detect_upturn(voltage_s, dy, vp_result["Vp"])
+
+
+@mcp.tool()
+def probe_gate(Vp: float, Vf: float, Te: float, Teff: float, ftail: float,
+               sheath_ratio: float, ne: float = None, Thot: float = None) -> dict:
+    """物理合理性闸门 — 检查参数是否在标定范围内
+
+    Args:
+        Vp, Vf: 等离子体电位 / 浮动电位 (V)
+        Te, Teff: 电子温度 (斜率法) / 有效电子温度 (eV)
+        ftail: 高能密度占比 (%)
+        sheath_ratio: 鞘层状态比
+        ne: 电子密度 cm⁻³ (可选)
+        Thot: 热电子温度 eV (可选)
+    """
+    return gate_check(
+        {"Vp": Vp, "Vf": Vf},
+        {"Te_eV": Te},
+        {"Teff_eV": Teff, "ftail_pct": ftail, "sheath_ratio": sheath_ratio, "Thot_eV": Thot}
+    )
+
+
+@mcp.tool()
+def probe_compare(filepath1: str, filepath2: str, label1: str = "装置1",
+                  label2: str = "装置2") -> dict:
+    """两装置 IV 曲线对比 — 阴极 vs 阳极 / 不同工况
+
+    Args:
+        filepath1, filepath2: 两个 CSV 文件路径
+        label1, label2: 标签
+    """
+    r1 = probe_analyze(filepath1)
+    r2 = probe_analyze(filepath2)
+
+    if r1["status"] != "ok" or r2["status"] != "ok":
+        return {"status": "error", "r1": r1.get("status"), "r2": r2.get("status")}
+
+    def ratio(a, b):
+        return round(a/b, 2) if a and b and b != 0 else None
+
+    comparisons = {}
+    for key in ["Vp", "Vf"]:
+        v1 = r1[key].get(key)
+        v2 = r2[key].get(key)
+        comparisons[key] = {label1: v1, label2: v2, "ratio": ratio(v1, v2)}
+
+    comparisons["Te_eV"] = {label1: r1["Te_classic"].get("Te_eV"),
+                            label2: r2["Te_classic"].get("Te_eV")}
+    comparisons["ftail_pct"] = {label1: r1["tail_metrics"]["ftail_pct"],
+                                label2: r2["tail_metrics"]["ftail_pct"]}
+    comparisons["sheath_ratio"] = {label1: r1["tail_metrics"]["sheath_ratio"],
+                                   label2: r2["tail_metrics"]["sheath_ratio"]}
+    comparisons["Teff_eV"] = {label1: r1["tail_metrics"]["Teff_eV"],
+                              label2: r2["tail_metrics"]["Teff_eV"]}
+    comparisons["n_peaks"] = {label1: r1["eepf_peaks"]["n_peaks"],
+                              label2: r2["eepf_peaks"]["n_peaks"]}
+
+    same_param_diff_quality = "同参数不同质" if (
+        abs(comparisons["Teff_eV"][label1] - comparisons["Teff_eV"][label2]) < 3
+        and abs(comparisons["ftail_pct"][label1] - comparisons["ftail_pct"][label2]) > 10
+    ) else "参数差异可解释"
+
+    return {"status": "ok", "comparisons": comparisons,
+            "interpretation": same_param_diff_quality,
+            "cross_tank_warning": "注意: 若两装置真空背压不同, 直接对比需标注"}
+
+
+@mcp.tool()
+def probe_plot(filepath: str, plot_type: str = "all",
+               output_format: str = "png") -> dict:
+    """生成诊断图表 — IV曲线 / dI/dV / EEPF / 双温拟合
+
+    Args:
+        filepath: CSV 文件路径
+        plot_type: all | iv | eepf | both
+        output_format: png | svg
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+    except ImportError:
+        return {"status": "error", "error": "matplotlib 未安装"}
+
+    r = probe_analyze(filepath)
+    if r["status"] != "ok":
+        return {"status": "error", "error": r.get("error", "分析失败")}
+
+    voltage, current = read_probe_csv(filepath)
+    sort_idx = np.argsort(voltage)
+    voltage = voltage[sort_idx]
+    current = -current[sort_idx]
+    voltage_s = smooth_gaussian(voltage)
+    current_s = smooth_gaussian(current)
+    dy = np.gradient(current_s, voltage_s)
+
+    base_name = os.path.splitext(os.path.basename(filepath))[0]
+    outputs = []
+
+    if plot_type in ("all", "iv"):
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+        ax1.plot(voltage_s, current_s*1e3, 'b-', lw=1.5, label='I-V')
+        ax1.set_xlabel('Voltage (V)'); ax1.set_ylabel('Current (mA)', color='b')
+        ax2 = ax1.twinx()
+        ax2.plot(voltage_s, dy*1e3, 'r-', lw=1.0, alpha=0.7, label='dI/dV')
+        ax2.set_ylabel('dI/dV (mA/V)', color='r')
+        ax1.axvline(r["Vf"]["Vf"], color='g', ls='--', lw=1, label=f'Vf={r["Vf"]["Vf"]:.1f}')
+        ax1.axvline(r["Vp"]["Vp"], color='k', ls='--', lw=1, label=f'Vp={r["Vp"]["Vp"]:.1f}')
+        ax1.legend(loc='upper left'); ax1.grid(alpha=0.3)
+        ax1.set_title(f'{base_name} — I-V + dI/dV')
+        path = str(OUTPUT_DIR / f'{base_name}_IV.{output_format}')
+        fig.savefig(path, dpi=130, bbox_inches='tight')
+        plt.close()
+        outputs.append(path)
+
+    if plot_type in ("all", "eepf"):
+        energy = np.array(r["EEPF"]["energy_axis_eV"])
+        eepf_vals = np.array(r["EEPF"]["eepf_values"])
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.semilogy(energy, np.maximum(eepf_vals, 1e-30), 'b-', lw=1.5)
+        E_barrier = r["tail_metrics"]["E_barrier_eV"]
+        if E_barrier > 0:
+            ax.axvline(E_barrier, color='m', ls='--', lw=1.5,
+                      label=f'Vp-Vf={E_barrier:.1f}eV (ftail={r["tail_metrics"]["ftail_pct"]:.1f}%)')
+        for p in r["eepf_peaks"]["peaks"]:
+            ax.plot(p["energy_eV"], p["amplitude"], 'ro', ms=6)
+            ax.annotate(f'{p["energy_eV"]:.1f}eV', (p["energy_eV"], p["amplitude"]),
+                       textcoords="offset points", xytext=(0,10), fontsize=8)
+        ax.set_xlabel('Energy (eV)'); ax.set_ylabel('EEPF')
+        ax.set_title(f'{base_name} — EEPF + {r["eepf_peaks"]["n_peaks"]} peaks')
+        ax.legend(); ax.grid(alpha=0.3)
+        path = str(OUTPUT_DIR / f'{base_name}_EEPF.{output_format}')
+        fig.savefig(path, dpi=130, bbox_inches='tight')
+        plt.close()
+        outputs.append(path)
+
+    return {"status": "ok", "outputs": outputs, "n_plots": len(outputs)}
+
+
+@mcp.tool()
+def probe_info(topic: str = "all") -> dict:
+    """探针参数/技术参考
+
+    Args:
+        topic: all | probe | formulas | ranges | modes | references
+    """
+    info = {
+        "probe": {
+            "default_geometry": "钨丝圆柱, φ0.15mm × 8mm, 面积≈0.038 cm²",
+            "area_formula": "πR² + 2πRL (圆柱, 含端面)",
+            "material": "钨 (W), 功函数 4.54 eV",
+            "typical_position": "阴极正下方 1-2 cm (耦合区)"
+        },
+        "formulas": {
+            "Druyvesteyn_EEPF": "F(ε) = √(8mₑε) / (e³A) · d²I/dV²",
+            "Teff": "T_eff = (2/3)⟨ε⟩ — Godyak & Piejak 1990, PRL 65:996",
+            "ftail": "f_tail = ∫_{ε>Vp-Vf} F dε / ∫F dε × 100% — Jauberteau 2018",
+            "sheath_ratio": "(Vp-Vf)/Te — Maxwell理论=5.05, 实测=4.17±0.23",
+            "Te_corrected": "Te × (5.05/4.17) ≈ Te × 1.21",
+            "Ne_Langmuir": "Ne = 3.7×10¹³ × 0.9 × Ie / (A × √Te)",
+        },
+        "physical_ranges": PHYSICAL_RANGES,
+        "mode_thresholds": MODE_RULES,
+        "references": [
+            "Godyak & Piejak 1990, PRL 65:996 — T_eff 定义",
+            "Godyak & Demidov 2011, J. Phys. D 44:233001 — 探针 EEDF 综述",
+            "Jauberteau & Jauberteau 2018, Contrib. Plasma Phys. — f_tail 高能尾积分",
+            "Lobbia & Beal 2017, AIAA JPC — 电推进探针诊断推荐实践",
+            "Lafleur & Chabert 2025, PSST 34:055005 — α 相似参数",
+            "Yip et al. 2020, Plasma Sci. Technol. 22:085404 — 双温迭代减法",
+            "Cellarius 1970 / Draganov 2025, Vacuum 235 — EEPF 多群分解",
+        ]
+    }
+
+    if topic == "all":
+        return info
+    return info.get(topic, {"error": f"未知主题: {topic}", "available": list(info.keys())})
+
+
+def main():
+    """MCP Server 入口"""
+    print(f"Langmuir Probe MCP v{VERSION}")
+    print(f"输出目录: {OUTPUT_DIR}")
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

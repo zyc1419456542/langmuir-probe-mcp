@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+langmuir_mcp_output/
+.env
+*.log

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "langmuir-probe-mcp"
+version = "1.0.0"
+description = "Langmuir Probe IV Analysis MCP — Druyvesteyn EEPF, mode detection, non-Maxwellian metrics"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "许墨" }]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+langmuir-probe-mcp = "langmuir_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["langmuir_mcp*"]
+exclude = ["tests*"]
