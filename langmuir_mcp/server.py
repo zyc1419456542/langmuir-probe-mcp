@@ -6,18 +6,21 @@ Langmuir Probe MCP Server v1.0.0 — IV 曲线分析 + EEPF + 模式检测 + 非
 纯 Python 实现，零 MATLAB 依赖。
 
 工具列表:
-  probe_analyze     — 单条 IV 曲线全量分析 (Vf/Vp/Te/Ne/EEPF/f_tail/T_eff...)
-  probe_batch        — 批量处理文件夹内所有 CSV
-  probe_ee pf        — 单独重建 EEPF (Druyvesteyn 公式)
-  probe_detect_modes — 模式判别 (SPOT/OSC/PLUME)
-  probe_detect_steps — dI/dV 台阶检测 + 四项伪影排除
-  probe_detect_upturn— dI/dV 末端上翘检测
-  probe_gate         — 物理合理性闸门
-  probe_compare      — 两装置对比 (阴极 vs 阳极)
-  probe_plot         — 生成诊断图表
-  probe_info         — 探针参数/技术参考
+  probe_analyze      — 单条 IV 曲线全量分析
+  probe_batch         — 批量处理文件夹内所有 CSV
+  probe_eepf          — 单独重建 EEPF (Druyvesteyn 公式)
+  probe_detect_modes  — 模式判别 (SPOT/OSC/PLUME)
+  probe_detect_steps  — dI/dV 台阶检测 + 四项伪影排除
+  probe_detect_upturn — dI/dV 末端上翘检测
+  probe_gate          — 物理合理性闸门 (数值/一致性)
+  probe_gate_multi_ai — 多AI联合审计闸门 (可选: 接入Ollama/OpenAI)
+  probe_visual_qa     — 批量多模态视觉验证 (VL模型看图核验)
+  probe_compare       — 两装置对比 (阴极 vs 阳极)
+  probe_plot          — 生成诊断图表
+  probe_info          — 探针参数/技术参考
 
 依赖: numpy, scipy, matplotlib, mcp
+可选: requests (多AI闸门 / 视觉验证需要远端LLM)
 """
 
 import json, os, sys, io, base64
@@ -39,6 +42,53 @@ mcp = FastMCP("langmuir-probe-mcp", instructions="朗缪尔探针 IV 分析 — 
 OUTPUT_DIR = Path(os.environ.get("PROBE_MCP_OUTPUT", Path.cwd() / "langmuir_mcp_output"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 VERSION = "1.0.0"
+
+# ── LLM backend config (for multi-AI gate + visual QA) ──
+_LLM_CONFIG = {
+    "numerical": os.environ.get("PROBE_LLM_NUMERICAL", ""),
+    "consistency": os.environ.get("PROBE_LLM_CONSISTENCY", ""),
+    "historical": os.environ.get("PROBE_LLM_HISTORICAL", ""),
+    "vision": os.environ.get("PROBE_LLM_VISION", ""),
+    "api_base": os.environ.get("PROBE_LLM_API_BASE", "http://127.0.0.1:11434/v1"),
+    "api_key": os.environ.get("PROBE_LLM_API_KEY", "ollama"),
+}
+
+def _call_llm(prompt: str, model: str, system: str = "", img_b64: str = "") -> dict:
+    """Call LLM via Ollama / OpenAI-compatible API. Supports vision if img_b64 provided."""
+    if not model:
+        return {"status": "skipped", "reason": "No LLM model configured"}
+    try:
+        import requests
+    except ImportError:
+        return {"status": "error", "error": "requests not installed: pip install requests"}
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+
+    if img_b64:
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img_b64}}
+        ]})
+    else:
+        messages.append({"role": "user", "content": prompt})
+
+    try:
+        resp = requests.post(
+            f"{_LLM_CONFIG['api_base']}/chat/completions",
+            json={"model": model, "messages": messages, "temperature": 0.3, "max_tokens": 1024},
+            headers={"Authorization": f"Bearer {_LLM_CONFIG['api_key']}"},
+            timeout=120,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return {"status": "ok", "model": model,
+                    "response": data["choices"][0]["message"]["content"],
+                    "tokens": data.get("usage", {})}
+        return {"status": "error", "http_status": resp.status_code, "body": resp.text[:500]}
+    except Exception as e:
+        return {"status": "error", "error": str(e)[:500]}
 
 # Path safety: prevent traversal
 _ALLOWED_BASES = [os.path.realpath(p) for p in
@@ -891,6 +941,165 @@ def probe_info(topic: str = "all") -> dict:
     if topic == "all":
         return info
     return info.get(topic, {"error": f"未知主题: {topic}", "available": list(info.keys())})
+
+@mcp.tool()
+def probe_gate_multi_ai(filepath: str, audit_dimensions: str = "all") -> dict:
+    """多AI联合审计闸门 — 3个LLM并行审查: 数值合理性 + 一致性 + 历史漂移
+
+    配置: PROBE_LLM_NUMERICAL=qwen3:32b PROBE_LLM_HISTORICAL=deepseek-r1:8b
+           PROBE_LLM_API_BASE=http://127.0.0.1:11434/v1
+
+    不配置LLM则回退到纯数值闸门(probe_gate)。
+
+    Args:
+        filepath: CSV文件路径
+        audit_dimensions: all | numerical | consistency | historical
+    """
+    base = probe_analyze(filepath)
+    if base["status"] != "ok":
+        return {"status": "error", "error": base.get("error", "基础分析失败")}
+
+    params = {
+        "Vp": base["Vp"]["Vp"], "Vf": base["Vf"]["Vf"],
+        "Te_eV": base["Te_classic"].get("Te_eV"),
+        "Teff_eV": base["tail_metrics"]["Teff_eV"],
+        "ftail_pct": base["tail_metrics"]["ftail_pct"],
+        "sheath_ratio": base["tail_metrics"]["sheath_ratio"],
+        "ne_cm3": base.get("Ne_classic_cm3"),
+        "n_peaks": base["eepf_peaks"]["n_peaks"],
+        "Thot_eV": base["eepf_peaks"]["Thot_eV"],
+        "mode": base["mode"]["mode"], "n_steps": base["staircase"]["n_steps"],
+        "has_upturn": base["upturn"]["has_upturn"],
+    }
+
+    system_prompt = "你是等离子体物理诊断专家。审计朗缪尔探针分析结果。只报告有具体证据的问题。每个问题标注严重程度ERROR/WARN/INFO。输出严格JSON。"
+
+    results = {}; all_pass = True; flags = []
+
+    # Numerical audit
+    if audit_dimensions in ("all", "numerical"):
+        model = _LLM_CONFIG["numerical"]
+        if model:
+            prompt = f"审计朗缪尔探针参数物理合理性。已知范围: Vp[-20,80]V, Vf[-40,40]V, Te[0.5,50]eV, Teff[1,100]eV, ne[1e6,1e13]cm-3, ftail[0,80]%, sheath[2,8]。参数:\n{json.dumps(params, indent=2, ensure_ascii=False)}\n输出JSON: {{\"violations\": [{{\"param\":\"...\", \"issue\":\"...\", \"severity\":\"ERROR|WARN|INFO\"}}]}}"
+            resp = _call_llm(prompt, model, system_prompt)
+            results["numerical"] = resp
+            if resp["status"] == "ok":
+                try:
+                    j = json.loads(resp["response"].split("```json")[-1].split("```")[0])
+                    if j.get("violations"): all_pass = False; flags.extend(j["violations"])
+                except: pass
+        else:
+            basic = probe_gate(params["Vp"], params["Vf"], params["Te_eV"] or 1, params["Teff_eV"], params["ftail_pct"], params["sheath_ratio"])
+            results["numerical"] = {"status": "fallback_basic_gate", "basic_gate": basic}
+            if not basic.get("passed"): all_pass = False
+
+    # Consistency audit
+    if audit_dimensions in ("all", "consistency"):
+        model = _LLM_CONFIG["consistency"] or _LLM_CONFIG["numerical"]
+        if model:
+            prompt = f"审计跨参数一致性。规则: 1)Vp>Vf 2)Teff>Te_slope(斜率法低估) 3)sheath_ratio~4.17±0.23 4)ftail~35%且n_peaks=1→肥尾单峰; ftail~35%且n_peaks≥6→多峰束状。参数:\n{json.dumps(params, indent=2, ensure_ascii=False)}\n输出JSON: {{\"issues\": [{{\"rule\":\"...\", \"status\":\"OK|VIOLATION\", \"detail\":\"...\"}}]}}"
+            resp = _call_llm(prompt, model, system_prompt)
+            results["consistency"] = resp
+            if resp["status"] == "ok":
+                try:
+                    j = json.loads(resp["response"].split("```json")[-1].split("```")[0])
+                    if any(i.get("status")=="VIOLATION" for i in j.get("issues",[])): all_pass = False
+                except: pass
+
+    # Historical drift
+    if audit_dimensions in ("all", "historical"):
+        model = _LLM_CONFIG["historical"] or _LLM_CONFIG["numerical"]
+        if model:
+            prompt = f"已知基线: sheath_ratio=4.17±0.23, f_tail(SPOT)=19.5%, f_tail(OSC)=21.2%, f_tail(PLUME)=34.7%, Teff(SPOT/OSC)=18-20eV, Teff(PLUME)=15eV。当前参数:\n{json.dumps(params, indent=2, ensure_ascii=False)}\n判断是否偏离基线。输出JSON: {{\"matches_baseline\": true/false, \"deviations\": [{{\"param\":\"...\", \"expected\":\"...\", \"actual\":\"...\", \"drift_pct\":...}}]}}"
+            resp = _call_llm(prompt, model, system_prompt)
+            results["historical"] = resp
+            if resp["status"] == "ok":
+                try:
+                    j = json.loads(resp["response"].split("```json")[-1].split("```")[0])
+                    if not j.get("matches_baseline", True): all_pass = False
+                except: pass
+
+    return {"status": "ok", "passed": all_pass, "dimensions_audited": list(results.keys()),
+            "flags": flags, "results": results,
+            "models": {k: v for k, v in _LLM_CONFIG.items() if k in ("numerical","consistency","historical","vision")}}
+
+
+@mcp.tool()
+def probe_visual_qa(folder_path: str, sample_n: int = 5, spatial_precompress: bool = True) -> dict:
+    """批量多模态视觉验证 — 生成诊断图→VL模型看图核验→对比数值结果
+
+    配置: PROBE_LLM_VISION=llava:13b PROBE_LLM_API_BASE=http://127.0.0.1:11434/v1
+    空间预压缩(默认): 全局图+局部放大图双图打包, 防VL token压缩丢失细节。
+
+    Args:
+        folder_path: 含CSV文件的文件夹
+        sample_n: 抽样数量 (默认5)
+        spatial_precompress: 是否启用空间预压缩 (默认true)
+    """
+    import glob as _glob, base64 as _b64, random as _random
+
+    model = _LLM_CONFIG["vision"]
+    if not model:
+        return {"status": "skipped", "reason": "未配置视觉模型。设置 PROBE_LLM_VISION=llava:13b。",
+                "setup_hint": "ollama pull llava:13b"}
+
+    csv_files = sorted(_glob.glob(os.path.join(folder_path, "*.csv")))
+    if not csv_files:
+        return {"status": "error", "error": "文件夹内无CSV"}
+
+    sample_files = _random.sample(csv_files, min(sample_n, len(csv_files)))
+
+    # Generate diagnostic plots
+    plot_paths = []
+    for fp in sample_files:
+        try:
+            r = probe_plot(fp, plot_type="all")
+            if r["status"] == "ok": plot_paths.extend(r["outputs"])
+        except: pass
+
+    # Spatial pre-compression: zoom on EEPF tail region
+    if spatial_precompress:
+        try:
+            import matplotlib; matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except: pass
+        for fp in sample_files[:min(3, len(sample_files))]:
+            try:
+                r = probe_analyze(fp)
+                if r["status"] == "ok" and r["EEPF"]["status"] == "ok":
+                    energy = np.array(r["EEPF"]["energy_axis_eV"])
+                    eepf_v = np.array(r["EEPF"]["eepf_values"])
+                    E_b = r["tail_metrics"]["E_barrier_eV"]
+                    fig, ax = plt.subplots(figsize=(8,5), dpi=150)
+                    mask = (energy > max(0,E_b-5)) & (energy < E_b+25)
+                    if np.sum(mask) > 3:
+                        ax.semilogy(energy[mask], np.maximum(eepf_v[mask],1e-30), 'b-', lw=2)
+                        ax.axvline(E_b, color='m', ls='--', lw=2)
+                        ax.set_title(f'EEPF tail zoom — {os.path.basename(fp)}')
+                        ax.set_xlabel('Energy (eV)'); ax.set_ylabel('EEPF'); ax.grid(alpha=0.3)
+                        zp = str(OUTPUT_DIR / f'zoom_tail_{os.path.basename(fp)}.png')
+                        fig.savefig(zp, dpi=150, bbox_inches='tight'); plt.close()
+                        plot_paths.append(zp)
+            except: pass
+
+    # VL verification (serial, one image at a time)
+    results = []
+    for pp in plot_paths:
+        try:
+            with open(pp, 'rb') as f:
+                img_b64 = _b64.b64encode(f.read()).decode()
+            prompt = "你是等离子体诊断图视觉验证器。看这张朗缪尔探针图: 1)标注(Vf/Vp线)清晰可读吗? 2)曲线平滑吗有无异常跳变? 3)峰标记(如有)是否合理? 4)有无制图错误? 输出JSON: {\"readable\":true/false,\"annotations_clear\":true/false,\"issues\":[\"...\"],\"overall\":\"OK|WARN\"}"
+            resp = _call_llm(prompt, model, img_b64=img_b64)
+            results.append({"image": os.path.basename(pp), "verification": resp})
+        except Exception as e:
+            results.append({"image": os.path.basename(pp), "verification": {"status":"error","error":str(e)[:200]}})
+
+    n_ok = sum(1 for r in results if r["verification"].get("status")=="ok")
+    mismatches = [r for r in results if "WARN" in str(r.get("verification",{}).get("response",""))]
+
+    return {"status": "ok", "n_total": len(results), "n_ok": n_ok,
+            "n_warn": len(mismatches), "mismatches": [{"image":m["image"]} for m in mismatches],
+            "spatial_precompress": spatial_precompress, "plot_paths": plot_paths, "results": results}
 
 
 def main():
